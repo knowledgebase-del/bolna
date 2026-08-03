@@ -2813,7 +2813,17 @@ class TaskManager(BaseManager):
 
         # Cancel any running LLM / function-call tasks so they don't add
         # phantom responses to the transcript after the call has ended.
-        if self.llm_task is not None and not self.llm_task.done():
+        #
+        # NEVER cancel the task we are running in. On the end_call path this coroutine IS
+        # llm_task (end_call tool -> __execute_function_call -> here), so cancelling it here
+        # delivers CancelledError at the next yield point — which is the ``await
+        # asyncio.sleep(2)`` inside TelephonyInputHandler.stop_handler. That kills the handler
+        # before it closes the websocket, so run() never returns, the post-call webhook never
+        # fires, and the telephony leg is left up until the caller hangs up themselves.
+        # (Web calls hid this: DefaultInputHandler.stop_handler has no yield before its close.)
+        # There is nothing to suppress in this case anyway — a task cannot race with itself.
+        current_task = asyncio.current_task()
+        if self.llm_task is not None and not self.llm_task.done() and self.llm_task is not current_task:
             logger.info("__process_end_of_conversation: Cancelling LLM task")
             self.llm_task.cancel()
             self.llm_task = None
