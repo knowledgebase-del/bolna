@@ -42,6 +42,67 @@ load_dotenv()
 logger = configure_logger(__name__)
 
 _DETERMINISTIC_REASONING_PREFIX = "deterministic:"
+
+# Cap on a tool result rendered into the routing history. Routing needs the SHAPE of the
+# result (status/count/id), never the whole body, and a large payload both costs tokens and
+# buries the conversation the router is supposed to be reading.
+_ROUTING_TOOL_RESULT_CHARS = 400
+
+
+def _routing_history_messages(node_history: List[dict]) -> List[dict]:
+    """The current node's history as plain text turns, safe for ANY chat-completions backend.
+
+    Routing used to replay assistant ``tool_calls`` and ``tool`` results verbatim whenever the
+    node had tool context. That is unsendable to Gemini through its OpenAI-compatibility
+    endpoint (which is where a Google agent's router points — see the wrapper's
+    ``_routing_overrides``), and it failed three different ways:
+
+      * ``Function call is missing a thought_signature in functionCall parts`` — Gemini 3.x
+        requires a signature on every functionCall part in history, the OpenAI schema has
+        nowhere to carry one, so the compat layer drops it. Attaching ``thought_signature``
+        to the tool_call does NOT survive either; only the native API round-trips it, which
+        is why ``gemini_llm`` keeps its own native Part cache and the router cannot.
+      * ``Please ensure that function call turn comes immediately after a user turn or after
+        a function response turn`` — a node slice can begin on an assistant tool_call.
+      * ``Requests ending with a model turn are not supported`` — a slice can end on the
+        assistant.
+
+    Every one of those raised out of ``_decide_next_node_llm``, which returns next_node=None,
+    which the caller cannot tell apart from "the router chose to stay". So routing silently
+    failed exactly where it matters most: the turn straight after a Function node, i.e. every
+    edge that branches on a tool result.
+
+    Tool turns therefore become narration on a ``user`` turn rather than protocol messages,
+    and the list is guaranteed to end on ``user`` — the router is being asked to decide, and
+    a decision request may not end on the model's own turn.
+    """
+    out: List[dict] = []
+    for msg in node_history:
+        role, content = msg.get("role"), msg.get("content")
+        if role == "assistant":
+            if msg.get("tool_calls"):
+                names = ", ".join(
+                    (tc.get("function") or {}).get("name") or "?" for tc in msg["tool_calls"]
+                )
+                out.append({"role": "user", "content": f"[assistant called tool: {names}]"})
+            elif content:
+                out.append({"role": "assistant", "content": content})
+        elif role == "tool":
+            body = str(content or "")[:_ROUTING_TOOL_RESULT_CHARS]
+            out.append({"role": "user", "content": f"[tool result: {body}]"})
+        elif role == "user" and content:
+            out.append({"role": "user", "content": content})
+
+    # Never end on the model's turn. Merging into the preceding user turn rather than
+    # appending a filler keeps the transcript readable and the turn count honest.
+    while out and out[-1]["role"] == "assistant":
+        tail = out.pop()
+        if out and out[-1]["role"] == "user":
+            out[-1] = {"role": "user", "content": f"{out[-1]['content']}\n[assistant said: {tail['content']}]"}
+        else:
+            out.append({"role": "user", "content": f"[assistant said: {tail['content']}]"})
+            break
+    return out
 _ROUTER_REASONING_PREFIX = f"{_DETERMINISTIC_REASONING_PREFIX}router:"
 _PROMPT_VAR_PATTERN = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
 
@@ -799,27 +860,7 @@ class GraphAgent(BaseAgent):
         node_history = (
             history[self.current_node_entry_index :] if self.current_node_entry_index < len(history) else history
         )
-        has_tool_context = any(msg.get("role") == "assistant" and msg.get("tool_calls") for msg in node_history)
-
-        if has_tool_context:
-            for msg in node_history:
-                role = msg.get("role")
-                if role == "assistant":
-                    if msg.get("tool_calls"):
-                        messages.append({"role": "assistant", "content": None, "tool_calls": msg["tool_calls"]})
-                    elif msg.get("content"):
-                        messages.append({"role": "assistant", "content": msg["content"]})
-                elif role == "tool":
-                    content = msg.get("content", "")
-                    messages.append({"role": "tool", "tool_call_id": msg.get("tool_call_id", ""), "content": content})
-                elif role == "user" and msg.get("content"):
-                    messages.append({"role": "user", "content": msg["content"]})
-        else:
-            for msg in node_history:
-                role = msg.get("role")
-                content = msg.get("content")
-                if role in ("user", "assistant") and content:
-                    messages.append({"role": role, "content": content})
+        messages.extend(_routing_history_messages(node_history))
 
         if len(messages) == 1:
             user_message = history[-1].get("content", "") if history else ""

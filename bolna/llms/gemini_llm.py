@@ -88,6 +88,18 @@ class GeminiLLM(BaseLLM):
         self.gemini_tools = [types.Tool(function_declarations=gemini_declarations)] if gemini_declarations else None
         # Keep raw bolna tools list for required-param validation at call time
         self.bolna_tools_raw = bolna_tools if isinstance(bolna_tools, list) else []
+        # Declarations by name, so a per-node subset can be rebuilt without re-parsing.
+        self._declarations_by_name = {d.name: d for d in gemini_declarations}
+
+        # The OpenAI-family classes (openai_llm, azure_llm, litellm) expose these two, and
+        # graph_agent gates ALL node-level tool behaviour on them: _get_tool_choice_for_node
+        # and _tools_for_node both bail on `getattr(llm, "trigger_function_call", False)`,
+        # and _missing_forced_function_vars reads `llm.tools`. Without them a graph node's
+        # `function_call` (the forced tool) and per-node tool scope were silently inert here
+        # — the model was merely free to call any tool it liked, so an end_call node could
+        # take an extra turn to hang up.
+        self.tools = self.bolna_tools_raw
+        self.trigger_function_call = bool(gemini_declarations)
         self.thinking_budget = kwargs.get("thinking_budget", 0)
         self.run_id = kwargs.get("run_id", None)
         self.language = kwargs.get("language", "en")
@@ -233,7 +245,19 @@ class GeminiLLM(BaseLLM):
 
         return None
 
-    def _build_config(self, system_instruction, request_json=False):
+    def _declarations_for(self, tools=None):
+        """Declarations visible this turn. ``tools`` is graph_agent's per-node subset in
+        OpenAI shape (or None for "everything")."""
+        if tools is None:
+            return list(self._declarations_by_name.values())
+        wanted = [
+            t.get("function", {}).get("name") or t.get("name")
+            for t in tools
+            if isinstance(t, dict)
+        ]
+        return [self._declarations_by_name[n] for n in wanted if n in self._declarations_by_name]
+
+    def _build_config(self, system_instruction, request_json=False, tools=None, tool_choice=None):
         config_kwargs = dict(
             system_instruction=system_instruction or None,
             max_output_tokens=self.max_tokens,
@@ -246,17 +270,32 @@ class GeminiLLM(BaseLLM):
             config_kwargs["thinking_config"] = thinking_config
 
         config = types.GenerateContentConfig(**config_kwargs)
-        if self.gemini_tools:
-            config.tools = self.gemini_tools
+
+        declarations = self._declarations_for(tools)
+        if declarations:
+            config.tools = [types.Tool(function_declarations=declarations)]
             config.automatic_function_calling = types.AutomaticFunctionCallingConfig(disable=True)
+
+            # A forced tool is Gemini's ANY mode restricted to that one name — the
+            # equivalent of OpenAI's tool_choice={"type": "function", ...}. As there, the
+            # turn returns the call rather than prose; task_manager's follow-up generation
+            # is what speaks after the tool result.
+            forced = ((tool_choice or {}).get("function") or {}).get("name")
+            if forced and forced in self._declarations_by_name:
+                config.tool_config = types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.ANY,
+                        allowed_function_names=[forced],
+                    )
+                )
+                logger.info(f"[GeminiLLM] forcing function {forced} for this turn")
         return config
 
     async def generate_stream(
         self, messages, synthesize=True, meta_info=None, tool_choice=None, tools=None
     ) -> AsyncIterable[LLMStreamChunk]:
-        # tools= accepted for interface parity; per-node scoping is not wired for Gemini.
         system_instruction, history = self._prepare_history(messages)
-        config = self._build_config(system_instruction)
+        config = self._build_config(system_instruction, tools=tools, tool_choice=tool_choice)
 
         start_time = now_ms()
         first_token_time = None
