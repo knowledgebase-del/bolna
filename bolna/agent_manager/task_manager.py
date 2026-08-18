@@ -3217,6 +3217,7 @@ class TaskManager(BaseManager):
                     run_id=self.run_id,
                 )
                 _transfer_end_recorded = False
+                _hvx_transfer_failed = False
                 try:
                     async with session.post(url, json=payload) as response:
                         response_text = await response.text()
@@ -3249,6 +3250,31 @@ class TaskManager(BaseManager):
                             }
                         )
                         _transfer_end_recorded = True
+                        # HVX: a wrapper reporting transfer_status "failed" has NOT moved
+                        # the call — the leg is still ours. Undo the optimistic
+                        # "transfer initiated" state written above, publish the body into
+                        # the routing context so a flow's expression edge on
+                        # transfer_status can evaluate, and let the turn continue.
+                        try:
+                            _hvx_body = json.loads(response_text)
+                        except (ValueError, TypeError):
+                            _hvx_body = None
+                        if isinstance(_hvx_body, dict) and _hvx_body.get("transfer_status") == "failed":
+                            _hvx_transfer_failed = True
+                            self.has_transfer = False
+                            if self.context_data is None:
+                                self.context_data = {}
+                            self.context_data.update(_hvx_body)
+                            _hvx_agent = self.tools.get("llm_agent")
+                            if _hvx_agent is not None and hasattr(_hvx_agent, "context_data"):
+                                _hvx_agent.context_data.update(_hvx_body)
+                            self.conversation_history.append_tool_result(
+                                resp.get("tool_call_id", ""), response_text
+                            )
+                            logger.info(
+                                f"HVX: transfer reported failed ({_hvx_body.get('reason')}) — "
+                                f"resuming the flow instead of going silent"
+                            )
                 except Exception as transfer_exc:
                     logger.warning(f"Transfer webhook did not respond (call likely redirected): {transfer_exc}")
                     self._finalize_api_call_detail(function_call_log, error=transfer_exc)
@@ -3283,7 +3309,8 @@ class TaskManager(BaseManager):
                                 "success": None,
                             }
                         )
-                return
+                if not _hvx_transfer_failed:
+                    return
 
         # switch_language tool handler (injected in BOTH flows): waits for in-flight
         if called_fun == "switch_language":
