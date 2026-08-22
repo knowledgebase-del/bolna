@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import re
 import socket
 from urllib.parse import quote, urlsplit
 
@@ -152,6 +153,54 @@ def substitute_var_markers(obj, values):
         return obj  # Primitives returned as-is
 
 
+# A {{name}} template in a URL or a header value.
+#
+# Two substitution syntaxes exist here, for two different jobs, and neither can do
+# the other's. A request BODY uses {"$var": "name"} markers, because a body is typed
+# JSON and a marker can carry a list or an object through intact. A URL or a header
+# is a string that usually needs the value embedded in other text —
+# "Bearer {{access_token}}", "/v1/patients/{{patient_id}}/appointments" — which a
+# marker cannot express. Double braces because that is what the portal's fields
+# already contain, so this is authorable without any UI change.
+_STRING_TEMPLATE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}")
+
+# A tool may override the default request timeout, but only within reason: longer
+# than this and the caller is listening to silence while the call clock runs.
+_DEFAULT_TIMEOUT_SECONDS = 10
+_MAX_TIMEOUT_SECONDS = 120
+
+
+def substitute_templates(text: str, values: dict, quote_value: bool = False):
+    """``(substituted text, names that had no value)``.
+
+    ``quote_value`` percent-encodes what it inserts, for URLs — a value carrying a
+    ``/`` or a ``?`` would otherwise change the shape of the request rather than
+    fill a slot in it.
+    """
+    missing = []
+
+    def replace(match):
+        name = match.group(1)
+        if name not in values:
+            missing.append(name)
+            return match.group(0)
+        value = str(values[name])
+        return quote(value, safe="") if quote_value else value
+
+    return _STRING_TEMPLATE.sub(replace, text), missing
+
+
+def resolve_timeout(timeout_ms) -> int:
+    """A tool's own request timeout in seconds, clamped, defaulting to 10."""
+    try:
+        seconds = int(timeout_ms) / 1000.0
+    except (TypeError, ValueError):
+        return _DEFAULT_TIMEOUT_SECONDS
+    if seconds <= 0:
+        return _DEFAULT_TIMEOUT_SECONDS
+    return int(min(seconds, _MAX_TIMEOUT_SECONDS))
+
+
 def unresolved_var_markers(obj) -> list:
     """Names of ``$var`` markers still present after substitution."""
     if isinstance(obj, dict):
@@ -247,10 +296,35 @@ def build_get_url(url, api_params):
 
 async def trigger_api(
     url, method, param, api_token, headers_data, meta_info, run_id, return_response_metadata=False,
-    context_values=None, **kwargs
+    context_values=None, timeout_ms=None, **kwargs
 ):
-    timeout_seconds = 10
+    timeout_seconds = resolve_timeout(timeout_ms)
     try:
+        # {{name}} in the URL and in header values, from the same pool the body
+        # resolves against: the call's variables, with the model's own arguments
+        # winning a clash.
+        #
+        # SUBSTITUTE FIRST, VALIDATE SECOND. validate_outbound_url is the SSRF guard,
+        # and a template can carry a host — a tool response feeding {{host}} into
+        # the URL would sail straight past a check run on the un-substituted string.
+        values = {**(context_values or {}), **kwargs}
+        url, missing = substitute_templates(url, values, quote_value=True)
+        if isinstance(headers_data, dict):
+            substituted = {}
+            for key, value in headers_data.items():
+                if isinstance(value, str):
+                    value, header_missing = substitute_templates(value, values)
+                    missing += header_missing
+                substituted[key] = value
+            headers_data = substituted
+        if missing:
+            # Same rule as an unresolved $var in the body: sending "Bearer {{token}}"
+            # verbatim is a request that fails somewhere less obvious.
+            raise ValueError(
+                f"tool call has {len(missing)} unresolved value(s) in its URL or headers: "
+                f"{', '.join(sorted(set(missing)))}"
+            )
+
         await validate_outbound_url(url)
         prepared_request = prepare_api_request(
             param, api_token, headers_data, context_values=context_values, **kwargs

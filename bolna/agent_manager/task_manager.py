@@ -3554,6 +3554,7 @@ class TaskManager(BaseManager):
                 run_id=self.run_id,
                 return_response_metadata=True,
                 context_values=context_values,
+                timeout_ms=tool_conf.get("timeout_ms"),
                 **resp,
             )
         except asyncio.CancelledError:
