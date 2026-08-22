@@ -64,6 +64,7 @@ from bolna.helpers.language_detector import LanguageDetector
 from bolna.helpers.language_switcher import LanguageSwitcher
 from bolna.transcriber.transcriber_pool import TranscriberPool
 from bolna.synthesizer.synthesizer_pool import SynthesizerPool
+from bolna.helpers.expression_evaluator import MISSING as EXPRESSION_MISSING, resolve_variable
 from bolna.helpers.utils import (
     structure_system_prompt,
     compute_function_pre_call_message,
@@ -883,6 +884,46 @@ class TaskManager(BaseManager):
     def _extract_api_call_runtime_args(resp):
         excluded_keys = {"model_response", "textual_response"}
         return {key: copy.deepcopy(value) for key, value in resp.items() if key not in excluded_keys}
+
+    def _captured_response_values(self, called_fun: str, response_data) -> dict:
+        """What a tool's response contributes to the call's variables.
+
+        Two modes, and which one applies is the tool author's choice:
+
+          * WITH a ``response_variables`` mapping — ``{name: path into the
+            response}`` — only the named values are captured, under the names
+            given. Paths are dot-notation and may index a list
+            (``available_slots.0.slot_id``), because real responses put the
+            interesting values inside arrays.
+          * WITHOUT one, the whole top level is merged, exactly as before. Every
+            existing agent keeps working unchanged.
+
+        The mapping is worth having for more than tidiness. Captured variables
+        share ONE flat namespace across every tool and every extracted variable,
+        merged blind, last write wins — so two tools that each return ``status``
+        silently overwrite each other, and a routing condition testing the first
+        one reads the second one's value. Naming the fields is how an author opts
+        out of that.
+
+        A path that does not resolve is skipped rather than stored empty, so an
+        ``exists`` edge can still tell "the API didn't return it" from "it came
+        back blank".
+        """
+        mapping = (self.kwargs.get("api_tools", {}).get("tools_params", {})
+                   .get(called_fun, {}).get("response_variables"))
+        if not isinstance(mapping, dict) or not mapping:
+            return response_data if isinstance(response_data, dict) else {}
+
+        captured = {}
+        for name, path in mapping.items():
+            if not name or not isinstance(path, str) or not path:
+                continue
+            value = resolve_variable(response_data, path)
+            if value is EXPRESSION_MISSING:
+                logger.info(f"{called_fun}: no value at {path!r} for variable {name!r} — skipping")
+                continue
+            captured[name] = value
+        return captured
 
     def _tool_context_values(self) -> dict:
         """The call's variables, flattened, for a tool's ``$var`` markers.
@@ -3534,15 +3575,16 @@ class TaskManager(BaseManager):
                 response_data = (
                     json.loads(function_response) if isinstance(function_response, str) else function_response
                 )
-                if isinstance(response_data, dict):
+                captured = self._captured_response_values(called_fun, response_data)
+                if captured:
                     # Update task manager's context_data
                     if self.context_data is None:
                         self.context_data = {}
-                    self.context_data.update(response_data)
+                    self.context_data.update(captured)
                     # Update graph agent's context_data for routing
                     if hasattr(self.tools.get("llm_agent"), "context_data"):
-                        self.tools["llm_agent"].context_data.update(response_data)
-                    logger.info(f"Merged API response into context_data: {list(response_data.keys())}")
+                        self.tools["llm_agent"].context_data.update(captured)
+                    logger.info(f"Merged API response into context_data: {list(captured.keys())}")
             except (json.JSONDecodeError, TypeError) as e:
                 logger.debug(f"Could not parse API response as JSON for context merge: {e}")
         if called_fun.startswith("check_availability_of_slots") and (

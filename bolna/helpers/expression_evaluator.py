@@ -14,6 +14,11 @@ logger = configure_logger(__name__)
 
 _MISSING = object()
 
+# Public alias: resolve_variable is used outside this module (task_manager reads a
+# tool response through it), and callers have to be able to tell "no value at that
+# path" from a legitimately falsy one.
+MISSING = _MISSING
+
 _COMPARISON_OPS = {
     ExpressionOperator.EQ: op.eq,
     ExpressionOperator.NEQ: op.ne,
@@ -24,15 +29,30 @@ _COMPARISON_OPS = {
 }
 
 
-def resolve_variable(context_data: dict, path: str) -> Any:
-    """Dot-notation lookup. Returns _MISSING if not found."""
+def resolve_variable(context_data: Any, path: str) -> Any:
+    """Dot-notation lookup. Returns _MISSING if not found.
+
+    A numeric segment indexes a list: ``available_slots.0.slot_id``. Real API
+    responses put the interesting values inside arrays, and a mapping that cannot
+    reach into one can only name the array itself.
+    """
     current = context_data
     for segment in path.split("."):
         if isinstance(current, dict) and segment in current:
             current = current[segment]
+        elif isinstance(current, (list, tuple)) and _is_index(segment):
+            index = int(segment)
+            if -len(current) <= index < len(current):
+                current = current[index]
+            else:
+                return _MISSING
         else:
             return _MISSING
     return current
+
+
+def _is_index(segment: str) -> bool:
+    return segment.lstrip("-").isdigit()
 
 
 _TRUE_TOKENS = {"true", "1", "yes"}
