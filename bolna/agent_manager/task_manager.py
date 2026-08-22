@@ -80,6 +80,7 @@ from bolna.helpers.utils import (
     resample,
     save_audio_file_to_s3,
     update_prompt_with_context,
+    SERVER_OWNED_CALL_IDENTIFIERS,
     get_md5_hash,
     static_node_audio_key,
     clean_json_string,
@@ -882,6 +883,40 @@ class TaskManager(BaseManager):
     def _extract_api_call_runtime_args(resp):
         excluded_keys = {"model_response", "textual_response"}
         return {key: copy.deepcopy(value) for key, value in resp.items() if key not in excluded_keys}
+
+    def _tool_context_values(self) -> dict:
+        """The call's variables, flattened, for a tool's ``$var`` markers.
+
+        Two tiers live in ``context_data`` and both belong here:
+
+          * ``recipient_data`` — what was known when the call was placed, plus the
+            time variables derived from it.
+          * top-level keys — everything captured since: tool responses merged in
+            after each call, and variables extracted by a routing transition.
+
+        Flattened because ``substitute_var_markers`` does a plain name lookup, not
+        the dot-notation walk the expression evaluator uses — a marker says
+        ``{"$var": "dob"}``, never ``recipient_data.dob``.
+
+        Call-start values win a name clash, matching prompt substitution: the
+        top-level namespace is uncontrolled (whatever an API happened to return),
+        so a stray response key must not quietly redefine a variable the caller
+        supplied. Engine bookkeeping (``_node_turns`` and friends) is left out,
+        and the server-owned call identifiers stay out for the same reason
+        ``update_prompt_with_context`` excludes them.
+        """
+        context = self.context_data if isinstance(self.context_data, dict) else {}
+        values = {
+            key: value for key, value in context.items()
+            if key != "recipient_data" and not key.startswith("_")
+        }
+        recipient = context.get("recipient_data")
+        if isinstance(recipient, dict):
+            values.update({
+                key: value for key, value in recipient.items()
+                if key not in SERVER_OWNED_CALL_IDENTIFIERS
+            })
+        return values
 
     def _build_call_context(self):
         """Common call-state fields included in the pre-call webhook payload.
@@ -3444,8 +3479,11 @@ class TaskManager(BaseManager):
             await asyncio.sleep(0.3)
 
         runtime_args = self._extract_api_call_runtime_args(resp)
+        context_values = self._tool_context_values()
         try:
-            prepared_request = prepare_api_request(param, api_token, headers, **runtime_args)
+            prepared_request = prepare_api_request(
+                param, api_token, headers, context_values=context_values, **runtime_args
+            )
         except Exception as exc:
             logger.warning(f"Could not prepare structured function call request for logging: {exc}")
             prepared_request = {
@@ -3474,6 +3512,7 @@ class TaskManager(BaseManager):
                 meta_info=meta_info,
                 run_id=self.run_id,
                 return_response_metadata=True,
+                context_values=context_values,
                 **resp,
             )
         except asyncio.CancelledError:

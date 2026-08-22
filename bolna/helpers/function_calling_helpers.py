@@ -152,12 +152,46 @@ def substitute_var_markers(obj, values):
         return obj  # Primitives returned as-is
 
 
-def prepare_api_request(param, api_token, headers_data, **kwargs):
+def unresolved_var_markers(obj) -> list:
+    """Names of ``$var`` markers still present after substitution."""
+    if isinstance(obj, dict):
+        if len(obj) == 1 and "$var" in obj:
+            return [obj["$var"]]
+        return [name for v in obj.values() for name in unresolved_var_markers(v)]
+    if isinstance(obj, list):
+        return [name for item in obj for name in unresolved_var_markers(item)]
+    return []
+
+
+def prepare_api_request(param, api_token, headers_data, context_values=None, **kwargs):
+    """Build a tool's outbound request.
+
+    ``kwargs`` are the model's own function-call arguments. ``context_values`` are
+    the call's variables — what the caller passed in when placing the call, plus
+    everything captured since (tool responses, extracted variables). A ``$var``
+    marker resolves against both, with the model's argument winning a name clash
+    since it is the more specific of the two.
+
+    Passed as one named dict rather than merged into ``kwargs`` on purpose: the
+    caller splats the model's response into ``trigger_api``, so a captured
+    variable named ``url`` or ``method`` would otherwise collide with that
+    function's own parameters and take the tool call down.
+    """
     request_body, api_params = None, None
     if param:
         # NEW FORMAT: Check for $var markers (type-safe JSON substitution)
         if isinstance(param, dict) and _contains_var_markers(param):
-            api_params = substitute_var_markers(param, kwargs)
+            api_params = substitute_var_markers(param, {**(context_values or {}), **kwargs})
+            missing = unresolved_var_markers(api_params)
+            if missing:
+                # Sending the marker object verbatim would POST {"$var": "dob"} where
+                # the API expects a string — silently malformed data reaching a real
+                # system. Raising instead surfaces as a normal tool error the model
+                # can route on (trigger_api catches it and returns an error body).
+                raise ValueError(
+                    f"tool call is missing {len(missing)} value(s) with no variable to "
+                    f"resolve from: {', '.join(sorted(set(missing)))}"
+                )
             request_body = json.dumps(api_params)
             logger.info("Using $var marker substitution for param")
         else:
@@ -212,12 +246,15 @@ def build_get_url(url, api_params):
 
 
 async def trigger_api(
-    url, method, param, api_token, headers_data, meta_info, run_id, return_response_metadata=False, **kwargs
+    url, method, param, api_token, headers_data, meta_info, run_id, return_response_metadata=False,
+    context_values=None, **kwargs
 ):
     timeout_seconds = 10
     try:
         await validate_outbound_url(url)
-        prepared_request = prepare_api_request(param, api_token, headers_data, **kwargs)
+        prepared_request = prepare_api_request(
+            param, api_token, headers_data, context_values=context_values, **kwargs
+        )
         request_body = prepared_request["request_body"]
         api_params = prepared_request["api_params"]
         headers = prepared_request["headers"]

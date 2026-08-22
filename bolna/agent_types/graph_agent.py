@@ -1155,23 +1155,52 @@ class GraphAgent(BaseAgent):
         return any(msg.get("role") == "tool" and msg.get("tool_call_id") in call_ids_for_fn for msg in node_history)
 
     def _prompt_context(self) -> Optional[dict]:
-        """Context for prompt substitution with time frozen at call start.
+        """Context for prompt substitution: BOTH tiers of the call's variables,
+        with time frozen at call start.
 
-        Routing re-enriches time live each turn for expression edges; the prompt
-        freezes it so its text stays identical across turns and the prompt cache
-        keeps hitting, matching normal agents which render time once at setup.
+        `update_prompt_with_context` reads one key — `recipient_data` — so that is
+        the only place a value can be seen from. Which meant everything captured
+        DURING the call (tool responses merged in after each call, variables
+        extracted by a routing transition) was invisible to prompts: a node that
+        said "your confirmation number is {confirmation_id}" rendered nothing at
+        all, because confirmation_id lives at the top level. Both tiers are folded
+        together here so a prompt can name any variable the call has.
+
+        Call-start values win a name clash. That keeps the change additive — every
+        prompt that resolved before resolves to the same value — and the top-level
+        namespace is uncontrolled (whatever an API happened to return), so a stray
+        response key must not quietly redefine one the caller supplied.
+
+        Time is still frozen: routing re-enriches it live each turn for expression
+        edges, but the prompt keeps one rendering so its text stays identical
+        across turns and the prompt cache keeps hitting. The captured values are
+        deliberately NOT frozen — freezing would bake in their state as of call
+        start, which is empty, defeating the point.
         """
-        if not self.context_data or not isinstance(self.context_data.get("recipient_data"), dict):
+        if not self.context_data:
             return self.context_data
-        recipient = self.context_data["recipient_data"]
+        recipient = self.context_data.get("recipient_data")
+        recipient = recipient if isinstance(recipient, dict) else {}
         if self._frozen_time_vars is None:
             timezone_str = recipient.get("timezone")
             if timezone_str:
                 enrich_context_with_time_variables(self.context_data, timezone_str)
+                # enrich writes through context_data, which may hold a different
+                # dict than the one defaulted above.
+                stored = self.context_data.get("recipient_data")
+                recipient = stored if isinstance(stored, dict) else recipient
             self._frozen_time_vars = {k: recipient[k] for k in _TIME_VAR_KEYS if k in recipient}
-        if not self._frozen_time_vars:
-            return self.context_data
-        return {**self.context_data, "recipient_data": {**recipient, **self._frozen_time_vars}}
+        # Same namespace a tool's $var markers resolve against — see
+        # task_manager._tool_context_values. Prompts and tool bodies naming the
+        # same variable and getting different answers would be indefensible.
+        captured = {
+            k: v for k, v in self.context_data.items()
+            if k != "recipient_data" and not k.startswith("_")
+        }
+        return {
+            **self.context_data,
+            "recipient_data": {**captured, **recipient, **self._frozen_time_vars},
+        }
 
     async def _build_messages(self, history: List[dict], meta_info: Optional[dict] = None) -> List[dict]:
         """Build messages array: system prompt + conversation history (+ optional trailing RAG)."""
@@ -1244,8 +1273,11 @@ class GraphAgent(BaseAgent):
         )
         if not text:
             return None
-        if self.context_data:
-            text = update_prompt_with_context(text, self.context_data)
+        # Through _prompt_context, not context_data directly: a Static Sentence node
+        # and a Prompt node naming the same variable must render the same thing.
+        prompt_context = self._prompt_context()
+        if prompt_context:
+            text = update_prompt_with_context(text, prompt_context)
         return {"static_message": text, "static_audio_hash": get_md5_hash(text)}
 
     async def generate(self, message: List[dict], **kwargs) -> AsyncGenerator:
