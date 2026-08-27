@@ -293,7 +293,8 @@ class GraphAgent(BaseAgent):
         }
 
     def _init_routing_client(self):
-        """Initialize routing client. Uses Groq if available, else OpenAI."""
+        """Initialize routing client. Groq if available, else OpenAI on its own credential,
+        else the agent's own LLM client (e.g. Gemini) as the single-provider fallback."""
         groq_available = GROQ_AVAILABLE and os.getenv("GROQ_API_KEY")
 
         # Auto-detect provider if not specified
@@ -326,10 +327,67 @@ class GraphAgent(BaseAgent):
                 self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_AZURE", "gpt-4.1-mini")
             logger.info(f"Routing initialized with Azure ({self.routing_model})")
         else:
-            self.routing_client = self.openai
-            if not self.routing_model:
-                self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
-            logger.info(f"Routing initialized with OpenAI ({self.routing_model})")
+            # `self.openai` is built from the AGENT's own llm_key/base_url (see __init__), so
+            # reusing it here means the router inherits whatever provider answers the call. On a
+            # Gemini agent — whose base_url is Google's OpenAI-compat endpoint — that routes on
+            # Gemini, which applies its default thinking budget to the routing call (only the
+            # gpt-5 branch in _decide_next_node_llm sends a reasoning cap) and measured 5-19s a
+            # turn. So prefer a DEDICATED OpenAI client when a key is available: its own
+            # credential, no base_url, each provider reached through its own endpoint.
+            #
+            # Without an OpenAI key we fall back to the agent's own client unchanged, which keeps
+            # single-provider (Gemini-only) deployments working. Note this only diverts agents
+            # that set a base_url; a plain OpenAI agent already had a real OpenAI client here.
+            routing_key = os.getenv("ROUTING_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+            if self.base_url and routing_key:
+                self.routing_client = OpenAI(api_key=routing_key)
+                # routing_model may have been pinned to the agent's OWN model by the caller (the
+                # wrapper does that for google agents) — a Gemini model name means nothing to
+                # OpenAI, so only keep an explicit choice when it is an OpenAI model.
+                if not (self.routing_model or "").startswith("gpt"):
+                    self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
+                logger.info(f"Routing initialized with OpenAI ({self.routing_model}) - dedicated client")
+            else:
+                self.routing_client = self.openai
+                if not self.routing_model:
+                    self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
+                logger.info(
+                    f"Routing initialized with the agent's own LLM client ({self.routing_model})"
+                    f"{' at ' + self.base_url if self.base_url else ''}"
+                )
+
+    def _gemini_routing_thinking_body(self):
+        """`extra_body` that caps thinking on a Gemini routing call, or None.
+
+        Only the gpt-5 branch in _decide_next_node_llm sends a reasoning cap, so a Gemini router
+        — the single-provider fallback in _init_routing_client — gets Google's DEFAULT thinking
+        budget every turn, measured at 5-19s for ~50 output tokens. Mirror the family split that
+        gemini_llm._get_thinking_config already applies to the main LLM: 3.x takes thinking_level,
+        2.5 takes thinking_budget, and sending the wrong one 400s.
+
+        Shape is Google's OpenAI-compat surface: the SDK's `extra_body=` kwarg merges into the
+        top-level request body, and the field Google reads there is itself named `extra_body` —
+        hence the double nesting. NOT verified against a live key, so the caller treats a
+        rejection as non-fatal and falls back to the (slow) uncapped call.
+        """
+        if getattr(self, "_routing_thinking_disabled", False):
+            return None
+
+        model = (self.routing_model or "").lower()
+        if "gemini" not in model:
+            return None
+
+        if "gemini-3" in model:
+            # Flash/Lite take "minimal"; Pro rejects it and needs "low" (see gemini_llm).
+            default = "low" if "pro" in model else "minimal"
+            thinking = {"thinking_level": os.getenv("GEMINI_ROUTING_THINKING_LEVEL", default)}
+        elif "2.5" in model:
+            # Pro cannot disable thinking — 128 is its floor; Flash/Lite take 0.
+            thinking = {"thinking_budget": 128 if "pro" in model else 0}
+        else:
+            return None
+
+        return {"extra_body": {"google": {"thinking_config": thinking}}}
 
     async def check_for_completion(self, messages, check_for_completion_prompt, meta_info=None):
         """Check if the conversation should end. Returns (hangup_dict, metadata)."""
@@ -890,7 +948,25 @@ class GraphAgent(BaseAgent):
 
             self._routing_reasoning_effort_used = routing_kwargs.get("reasoning_effort")
 
-            response = await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
+            thinking_body = self._gemini_routing_thinking_body()
+            if thinking_body:
+                routing_kwargs["extra_body"] = thinking_body
+
+            try:
+                response = await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
+            except Exception as e:
+                # Fail OPEN. An endpoint that rejects the thinking field must not take the call
+                # down — drop it, remember for the rest of the agent's life, and retry once. The
+                # worst case is the slow routing we had before, not a dead turn.
+                if not thinking_body:
+                    raise
+                logger.warning(
+                    f"Routing call rejected the Gemini thinking config ({e}); retrying without it "
+                    "and disabling it for this agent"
+                )
+                self._routing_thinking_disabled = True
+                routing_kwargs.pop("extra_body", None)
+                response = await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
             latency_ms = (time.perf_counter() - start_time) * 1000
 
             # Extract token usage from routing LLM call
