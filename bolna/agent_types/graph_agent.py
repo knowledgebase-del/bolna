@@ -967,6 +967,7 @@ class GraphAgent(BaseAgent):
             if user_message:
                 messages.append({"role": "user", "content": user_message})
 
+        self._last_routing_http_ms = None
         try:
             routing_kwargs = {
                 "model": self.routing_model,
@@ -1084,7 +1085,6 @@ class GraphAgent(BaseAgent):
         """Precedence: expression edges, then intent edges via one LLM call, then the
         unconditional default. Without an unconditional edge the node may stay."""
         start_time = time.perf_counter()
-        self._last_routing_http_ms = None
         self._last_deterministic_eval = None
 
         current_node = self.get_node_by_id(self.current_node_id)
@@ -1523,6 +1523,9 @@ class GraphAgent(BaseAgent):
                         "routing_model": self.routing_model,
                         "routing_provider": getattr(self, "routing_provider", None),
                         "routing_latency_ms": round(routing_latency_ms, 1),
+                        # Provider round trip only; routing_latency_ms minus this is the
+                        # in-process cost of building the routing request.
+                        "routing_http_ms": getattr(self, "_last_routing_http_ms", None),
                         "routing_reasoning_effort": getattr(self, "_routing_reasoning_effort_used", None),
                         "extracted_params": extracted_params or {},
                         "node_history": list(self.node_history),
