@@ -8,7 +8,8 @@ from bolna.models import *
 from bolna.agent_types.base_agent import BaseAgent
 from bolna.helpers.logger_config import configure_logger
 from bolna.helpers.rag_service_client import RAGServiceClientSingleton
-from bolna.helpers.utils import now_ms, format_messages
+from bolna.constants import LLM_ERROR_FALLBACK_MESSAGE
+from bolna.helpers.utils import now_ms, format_messages, select_message_by_language
 from bolna.llms.types import LLMStreamChunk, LatencyData
 from bolna.providers import SUPPORTED_LLM_PROVIDERS
 from bolna.llms import OpenAiLLM
@@ -326,10 +327,17 @@ Use this information naturally when it helps answer the user's questions. Don't 
                 yield chunk
 
         except Exception as e:
-            logger.error(f"generate() error: {e}")
+            logger.error(f"generate() error: {e}", exc_info=True)
             latency_data = LatencyData(
                 sequence_id=meta_info.get("sequence_id") if meta_info else None,
                 first_token_latency_ms=0,
                 total_stream_duration_ms=now_ms() - start_time,
             )
-            yield LLMStreamChunk(data=f"An error occurred: {str(e)}", end_of_stream=True, latency=latency_data)
+            # Never speak the exception to the caller — see LLM_ERROR_FALLBACK_MESSAGE.
+            yield LLMStreamChunk(
+                data=select_message_by_language(
+                    LLM_ERROR_FALLBACK_MESSAGE, (meta_info or {}).get("detected_language")
+                ),
+                end_of_stream=True,
+                latency=latency_data,
+            )

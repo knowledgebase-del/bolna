@@ -93,6 +93,19 @@ PRE_FUNCTION_CALL_MESSAGE = {
     "ge": "Geben Sie mir einen Moment Zeit, ich bin gleich wieder bei Ihnen.",
 }
 
+# Spoken when the LLM stream raises (provider 5xx, timeout, transport error).
+#
+# The agents used to yield the exception text itself as the assistant's turn, so the
+# synthesizer read the provider's error to the caller — an observed call ended with
+# Cartesia speaking «An error occurred: 503 Service Unavailable. {'message': '{ "error":
+# { "code": 503 …». Nothing downstream filters an assistant turn, so the only place to
+# stop it is where it is produced. This also lands in the conversation history, which
+# the router reads on the next turn, so it has to read as a plausible thing to have said.
+LLM_ERROR_FALLBACK_MESSAGE = {
+    "en": "Sorry, I didn't catch that — could you say it again?",
+    "ge": "Entschuldigung, das habe ich nicht verstanden — können Sie das wiederholen?",
+}
+
 FILLER_PHRASES = [
     "No worries.",
     "It's fine.",

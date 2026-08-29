@@ -1,5 +1,7 @@
+import asyncio
 import os
 import json
+import time
 import uuid
 import base64
 from typing import AsyncIterable
@@ -11,6 +13,61 @@ from .llm import BaseLLM
 from .types import LLMStreamChunk, LatencyData, FunctionCallPayload
 
 logger = configure_logger(__name__)
+
+
+# ── Deadlines ────────────────────────────────────────────────────────────────
+# google-genai builds its client with `retry_args(None)` -> stop_after_attempt(1)
+# and `timeout=None` unless http_options is passed: no retries and NO client-side
+# deadline at all. A degraded Gemini backend therefore blocks the turn for as long
+# as it likes — measured 20.9s in a live call (which then 503'd and killed it), and
+# 34.7s / 41.1s / 72.8s on direct probes during the same incident.
+#
+# HttpOptions.timeout cannot supply the real cap: it is also sent as X-Server-Timeout,
+# and the API rejects anything under 10s ("Manually set deadline 8s is too short.
+# Minimum allowed deadline is 10s", 400 INVALID_ARGUMENT). It is also a TOTAL request
+# timeout on the aiohttp transport, so tightening it would abort long healthy streams.
+#
+# So the SDK timeout stays at Google's 10s floor as a backstop, and the deadline that
+# actually matters is enforced here per-chunk: one budget to the first token, then a
+# stall budget between chunks. That caps the wait without limiting total response
+# length, which is the right shape for streaming into a voice call.
+GEMINI_HTTP_TIMEOUT_MS = int(os.getenv("GEMINI_HTTP_TIMEOUT_MS", "10000"))  # >= 10000, API floor
+GEMINI_FIRST_TOKEN_TIMEOUT_S = float(os.getenv("GEMINI_FIRST_TOKEN_TIMEOUT_S", "4.0"))
+GEMINI_STALL_TIMEOUT_S = float(os.getenv("GEMINI_STALL_TIMEOUT_S", "4.0"))
+# Retries are for a transient 5xx on the initial response. Keep the budget small: a
+# voice turn cannot absorb the SDK's default 4 retries at 1/2/4/8s of backoff.
+GEMINI_RETRY_ATTEMPTS = int(os.getenv("GEMINI_RETRY_ATTEMPTS", "2"))  # including the first call
+GEMINI_RETRY_INITIAL_DELAY_S = float(os.getenv("GEMINI_RETRY_INITIAL_DELAY_S", "0.25"))
+GEMINI_RETRY_MAX_DELAY_S = float(os.getenv("GEMINI_RETRY_MAX_DELAY_S", "1.0"))
+
+
+def _gemini_http_options() -> types.HttpOptions:
+    return types.HttpOptions(
+        timeout=GEMINI_HTTP_TIMEOUT_MS,
+        retry_options=types.HttpRetryOptions(
+            attempts=GEMINI_RETRY_ATTEMPTS,
+            initial_delay=GEMINI_RETRY_INITIAL_DELAY_S,
+            max_delay=GEMINI_RETRY_MAX_DELAY_S,
+        ),
+    )
+
+
+async def _iter_with_deadline(stream, first_token_timeout: float, stall_timeout: float):
+    """Yield from `stream`, failing fast if it goes quiet.
+
+    `first_token_timeout` covers the wait for the first chunk; `stall_timeout` the gap
+    between any two later chunks. Raises asyncio.TimeoutError, which the calling agent
+    turns into the spoken fallback rather than dead air.
+    """
+    iterator = stream.__aiter__()
+    budget = first_token_timeout
+    while True:
+        try:
+            chunk = await asyncio.wait_for(iterator.__anext__(), timeout=budget)
+        except StopAsyncIteration:
+            return
+        yield chunk
+        budget = stall_timeout
 
 
 def _usage_kwargs(usage) -> dict:
@@ -52,7 +109,7 @@ class GeminiLLM(BaseLLM):
 
         self.temperature = temperature
         api_key = kwargs.get("llm_key", os.getenv("GOOGLE_API_KEY"))
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(api_key=api_key, http_options=_gemini_http_options())
 
         self.api_params = kwargs.get("api_tools", {}).get("tools_params", {})
         bolna_tools = kwargs.get("api_tools", {}).get("tools", [])
@@ -315,12 +372,22 @@ class GeminiLLM(BaseLLM):
         _tool_dispatched = False
 
         try:
-            response_stream = await self.client.aio.models.generate_content_stream(
-                model=self.model,
-                contents=history,
-                config=config,
+            # The open() call covers the SDK's own retries, so it shares the first-token
+            # budget rather than getting one of its own — otherwise a retried 503 could
+            # spend the budget twice before a single chunk arrives.
+            opened_at = time.monotonic()
+            response_stream = await asyncio.wait_for(
+                self.client.aio.models.generate_content_stream(
+                    model=self.model,
+                    contents=history,
+                    config=config,
+                ),
+                timeout=GEMINI_FIRST_TOKEN_TIMEOUT_S,
             )
-            async for chunk in response_stream:
+            remaining = GEMINI_FIRST_TOKEN_TIMEOUT_S - (time.monotonic() - opened_at)
+            async for chunk in _iter_with_deadline(
+                response_stream, max(remaining, 0.05), GEMINI_STALL_TIMEOUT_S
+            ):
                 now = now_ms()
                 if not first_token_time:
                     first_token_time = now
@@ -428,6 +495,15 @@ class GeminiLLM(BaseLLM):
                         yield LLMStreamChunk(data=split[0], end_of_stream=False, latency=latency_data)
                         buffer = split[1] if len(split) > 1 else ""
 
+        except asyncio.TimeoutError:
+            # str(TimeoutError) is empty, so spell out which budget expired.
+            phase = "first token" if first_token_time is None else "mid-stream (stall)"
+            budget = GEMINI_FIRST_TOKEN_TIMEOUT_S if first_token_time is None else GEMINI_STALL_TIMEOUT_S
+            logger.error(
+                f"Gemini timed out waiting for {phase} after {budget}s "
+                f"(model={self.model}, elapsed={now_ms() - start_time:.0f}ms)"
+            )
+            raise
         except Exception as e:
             logger.error(f"Gemini unexpected error: {e}")
             raise

@@ -20,6 +20,7 @@ from bolna.helpers.utils import (
     get_md5_hash,
     select_message_by_language,
 )
+from bolna.constants import LLM_ERROR_FALLBACK_MESSAGE
 from bolna.helpers.expression_evaluator import evaluate_edge_expression, describe_edge_expression
 from bolna.enums import EdgeConditionType, NodeType, ToolScope
 from bolna.llms.types import LLMStreamChunk, LatencyData
@@ -1526,10 +1527,18 @@ class GraphAgent(BaseAgent):
                 yield chunk
 
         except Exception as e:
-            logger.error(f"Error in generate: {e}")
+            logger.error(f"Error in generate: {e}", exc_info=True)
             latency_data = LatencyData(
                 sequence_id=meta_info.get("sequence_id") if meta_info else None,
                 first_token_latency_ms=0,
                 total_stream_duration_ms=now_ms() - start_time,
             )
-            yield LLMStreamChunk(data=f"An error occurred: {str(e)}", end_of_stream=True, latency=latency_data)
+            # Speak a neutral retry prompt, never the exception — this string is
+            # synthesized straight to the caller. The real error is in the log above.
+            yield LLMStreamChunk(
+                data=select_message_by_language(
+                    LLM_ERROR_FALLBACK_MESSAGE, (meta_info or {}).get("detected_language")
+                ),
+                end_of_stream=True,
+                latency=latency_data,
+            )
