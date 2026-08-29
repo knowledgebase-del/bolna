@@ -1524,8 +1524,12 @@ class GraphAgent(BaseAgent):
                         "routing_provider": getattr(self, "routing_provider", None),
                         "routing_latency_ms": round(routing_latency_ms, 1),
                         # Provider round trip only; routing_latency_ms minus this is the
-                        # in-process cost of building the routing request.
-                        "routing_http_ms": getattr(self, "_last_routing_http_ms", None),
+                        # in-process cost of building the routing request. None on a
+                        # deterministic/expression route — no request was made, and the
+                        # previous turn's value must not be reported as this one's.
+                        "routing_http_ms": (
+                            getattr(self, "_last_routing_http_ms", None) if routing_messages else None
+                        ),
                         "routing_reasoning_effort": getattr(self, "_routing_reasoning_effort_used", None),
                         "extracted_params": extracted_params or {},
                         "node_history": list(self.node_history),

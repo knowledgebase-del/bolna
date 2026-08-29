@@ -121,8 +121,18 @@ class StreamSynthesizer(BaseSynthesizer):
         ws = self.websocket
         return ws is not None and ws.state is not websockets.protocol.State.CLOSED
 
-    async def _wait_for_ws(self, poll_interval=1):
-        """Block until the WebSocket is connected."""
+    async def _wait_for_ws(self, poll_interval=0.05):
+        """Block until the WebSocket is connected.
+
+        The interval is the resolution of this wait, and it lands on the call's
+        critical path: the first-message task reaches here before the provider
+        socket is up, so the welcome cannot be synthesized until the next poll.
+        At the old 1s default a Cartesia socket that connected in 305ms was not
+        noticed for another 695ms — measured 58.455 wait -> 58.760 connected ->
+        59.456 first send, almost exactly one full interval wasted on every call.
+        50ms costs nothing (this loop only runs while a socket is down) and gives
+        back most of that.
+        """
         while not self._is_ws_connected():
             if self.conversation_ended or self.connection_error:
                 logger.info(
