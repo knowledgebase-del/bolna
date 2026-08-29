@@ -3800,6 +3800,9 @@ class TaskManager(BaseManager):
                         self.routing_latencies["turn_latencies"].append(
                             {
                                 "latency_ms": routing_info["routing_latency_ms"],
+                                # Provider round trip alone; latency_ms minus this is the
+                                # in-process cost of building the routing request.
+                                "http_ms": routing_info.get("routing_http_ms"),
                                 "routing_end_ms": round(time.time() * 1000 - self.conversation_start_init_ts, 2),
                                 "routing_model": routing_info.get("routing_model"),
                                 "routing_provider": routing_info.get("routing_provider"),

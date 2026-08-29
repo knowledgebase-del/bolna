@@ -3,7 +3,7 @@ from collections import defaultdict
 import os
 import re
 import time
-from openai import OpenAI, AzureOpenAI
+from openai import OpenAI, AzureOpenAI, AsyncOpenAI, AsyncAzureOpenAI
 from dotenv import load_dotenv
 import json
 
@@ -137,9 +137,11 @@ class GraphAgent(BaseAgent):
         # Initialize OpenAI client with credentials (supports EU routing)
         if self.base_url:
             self.openai = OpenAI(api_key=self.llm_key, base_url=self.base_url)
+            self.openai_async = AsyncOpenAI(api_key=self.llm_key, base_url=self.base_url)
             logger.info(f"OpenAI client initialized with custom base_url: {self.base_url}")
         else:
             self.openai = OpenAI(api_key=self.llm_key)
+            self.openai_async = AsyncOpenAI(api_key=self.llm_key)
 
         self.node_history = [self.current_node_id]
         self.current_node_entry_index = 0
@@ -293,6 +295,21 @@ class GraphAgent(BaseAgent):
             "used_sources": used_sources or [],
         }
 
+    def _set_routing_client(self, client, async_client=None):
+        """Record the routing client, preferring a native-async one when we have it.
+
+        The routing call sits on the critical path of every turn, and the sync SDK has to
+        be driven through asyncio.to_thread. That hand-off is not free while the event
+        loop is saturated with audio work: the same routing request measured 943ms in
+        isolation on this box and 1457ms mid-call. A native async client removes the
+        thread hop (and the GIL ping-pong with the audio path) entirely.
+
+        Only openai/azure get one — Groq and the single-provider fallback keep the
+        threaded path, which still works, just without the saving.
+        """
+        self.routing_client = client
+        self.routing_client_async = async_client
+
     def _init_routing_client(self):
         """Initialize routing client. Groq if available, else OpenAI on its own credential,
         else the agent's own LLM client (e.g. Gemini) as the single-provider fallback."""
@@ -304,7 +321,7 @@ class GraphAgent(BaseAgent):
 
         if self.routing_provider == "groq":
             if groq_available:
-                self.routing_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+                self._set_routing_client(Groq(api_key=os.getenv("GROQ_API_KEY")))
                 # Default to llama-3.3-70b-versatile (best for multilingual routing)
                 if not self.routing_model:
                     self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_GROQ", "llama-3.3-70b-versatile")
@@ -313,14 +330,17 @@ class GraphAgent(BaseAgent):
                 logger.warning(
                     "Groq requested but GROQ_API_KEY not set or groq package not installed, falling back to OpenAI"
                 )
-                self.routing_client = self.openai
+                self._set_routing_client(self.openai, self.openai_async)
                 self.routing_provider = "openai"
                 self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
         elif self.routing_provider == "azure":
             azure_endpoint = self.base_url or os.getenv("AZURE_OPENAI_ENDPOINT")
             api_version = self.config.get("api_version") or os.getenv("AZURE_OPENAI_API_VERSION", "2024-12-01-preview")
-            self.routing_client = AzureOpenAI(
-                azure_endpoint=azure_endpoint, api_key=self.llm_key, api_version=api_version
+            self._set_routing_client(
+                AzureOpenAI(azure_endpoint=azure_endpoint, api_key=self.llm_key, api_version=api_version),
+                AsyncAzureOpenAI(
+                    azure_endpoint=azure_endpoint, api_key=self.llm_key, api_version=api_version
+                ),
             )
             if self.routing_model:
                 self.routing_model = self.routing_model.split("/", 1)[-1]
@@ -341,7 +361,7 @@ class GraphAgent(BaseAgent):
             # that set a base_url; a plain OpenAI agent already had a real OpenAI client here.
             routing_key = os.getenv("ROUTING_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
             if self.base_url and routing_key:
-                self.routing_client = OpenAI(api_key=routing_key)
+                self._set_routing_client(OpenAI(api_key=routing_key), AsyncOpenAI(api_key=routing_key))
                 # routing_model may have been pinned to the agent's OWN model by the caller (the
                 # wrapper does that for google agents) — a Gemini model name means nothing to
                 # OpenAI, so only keep an explicit choice when it is an OpenAI model.
@@ -349,7 +369,7 @@ class GraphAgent(BaseAgent):
                     self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
                 logger.info(f"Routing initialized with OpenAI ({self.routing_model}) - dedicated client")
             else:
-                self.routing_client = self.openai
+                self._set_routing_client(self.openai, self.openai_async)
                 if not self.routing_model:
                     self.routing_model = os.getenv("DEFAULT_ROUTING_MODEL_OPENAI", "gpt-4.1-mini")
                 logger.info(
@@ -687,6 +707,8 @@ class GraphAgent(BaseAgent):
             "routing_model": self.routing_model if made_llm_call else None,
             "routing_provider": self.routing_provider if made_llm_call else None,
             "routing_latency_ms": round(latency_ms, 1),
+            # Provider round trip only; routing_latency_ms minus this is our own overhead.
+            "routing_http_ms": getattr(self, "_last_routing_http_ms", None) if made_llm_call else None,
             "extracted_params": extracted_params or {},
             "node_history": list(self.node_history),
             "routing_messages": routing_messages,
@@ -856,6 +878,25 @@ class GraphAgent(BaseAgent):
             ),
         )
 
+    async def _routing_completion(self, **routing_kwargs):
+        """One routing request, natively async where the provider client allows it.
+
+        Falls back to the threaded sync client for Groq and the single-provider path,
+        so no deployment loses routing if it has no async twin. See _set_routing_client.
+
+        Records the provider round trip in ``_last_routing_http_ms``. routing_latency_ms
+        is clocked from before context enrichment, edge classification and prompt
+        building, so on its own it cannot say whether a slow turn was the provider or
+        us; the difference between the two is the in-process cost.
+        """
+        started = time.perf_counter()
+        try:
+            if getattr(self, "routing_client_async", None) is not None:
+                return await self.routing_client_async.chat.completions.create(**routing_kwargs)
+            return await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
+        finally:
+            self._last_routing_http_ms = round((time.perf_counter() - started) * 1000, 1)
+
     async def _decide_next_node_llm(
         self, node: dict, llm_edges: list, history: List[dict], start_time: float, default_edge: Optional[dict] = None
     ) -> Tuple[
@@ -954,7 +995,7 @@ class GraphAgent(BaseAgent):
                 routing_kwargs["extra_body"] = thinking_body
 
             try:
-                response = await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
+                response = await self._routing_completion(**routing_kwargs)
             except Exception as e:
                 # Fail OPEN. An endpoint that rejects the thinking field must not take the call
                 # down — drop it, remember for the rest of the agent's life, and retry once. The
@@ -967,7 +1008,7 @@ class GraphAgent(BaseAgent):
                 )
                 self._routing_thinking_disabled = True
                 routing_kwargs.pop("extra_body", None)
-                response = await asyncio.to_thread(self.routing_client.chat.completions.create, **routing_kwargs)
+                response = await self._routing_completion(**routing_kwargs)
             latency_ms = (time.perf_counter() - start_time) * 1000
 
             # Extract token usage from routing LLM call
@@ -1043,6 +1084,7 @@ class GraphAgent(BaseAgent):
         """Precedence: expression edges, then intent edges via one LLM call, then the
         unconditional default. Without an unconditional edge the node may stay."""
         start_time = time.perf_counter()
+        self._last_routing_http_ms = None
         self._last_deterministic_eval = None
 
         current_node = self.get_node_by_id(self.current_node_id)
