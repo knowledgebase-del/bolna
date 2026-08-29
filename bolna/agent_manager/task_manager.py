@@ -95,6 +95,7 @@ from bolna.helpers.utils import (
     format_error_message,
     enrich_context_with_time_variables,
 )
+from bolna.helpers import stream_observer
 from bolna.helpers.logger_config import configure_logger
 from ..helpers.mark_event_meta_data import MarkEventMetaData
 from ..helpers.observable_variable import ObservableVariable
@@ -3973,6 +3974,17 @@ class TaskManager(BaseManager):
 
                 llm_response += " " + data
 
+                # Stream the answer as it forms. Keyed with response_uid (falling back to
+                # turn_id) because that is exactly what ConversationHistory.append_assistant
+                # stamps on the committed turn — a different key here would render the
+                # partials as a second bubble instead of growing the first.
+                if self._is_conversation_task():
+                    stream_observer.emit_partial(
+                        "assistant",
+                        llm_response.strip(),
+                        meta_info.get("response_uid") or meta_info.get("turn_id"),
+                    )
+
                 logger.info(f"Got a response from LLM {llm_response}")
                 if end_of_llm_stream:
                     meta_info["end_of_llm_stream"] = True
@@ -4721,6 +4733,12 @@ class TaskManager(BaseManager):
 
                         interim_transcript_len += len(message["data"].get("content").strip().split(" "))
                         transcript_content = message["data"].get("content", "")
+
+                        # No key: the caller's final transcript is committed by
+                        # append_user with no key either, so leaving it null lets a
+                        # consumer merge the interims and the final into one bubble on
+                        # "still open" rather than on identity.
+                        stream_observer.emit_partial("user", transcript_content.strip())
 
                         # Deepgram sometimes delivers the real speech_final for an utterance
                         # *after* our utterance timeout already force-finalized the same text
