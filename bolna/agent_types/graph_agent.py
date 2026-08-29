@@ -166,6 +166,12 @@ class GraphAgent(BaseAgent):
         self.routing_reasoning_effort = self.config.get("routing_reasoning_effort")
         self.routing_max_tokens = self.config.get("routing_max_tokens")
         self.service_tier = self.config.get("service_tier")
+        # Scoped to the routing call. `service_tier` alone would also reach the main LLM
+        # (it is in the llm_kwargs passthrough below, and openai_llm sets model_args from
+        # it), so an agent that wants a faster ROUTER without moving its conversation
+        # model onto a pricier tier needs its own key. Falls back to service_tier so an
+        # agent that set only that keeps today's behaviour.
+        self.routing_service_tier = self.config.get("routing_service_tier") or self.service_tier
         logger.info(
             f"GraphAgent routing_instructions loaded: {bool(self.routing_instructions)} (length: {len(self.routing_instructions) if self.routing_instructions else 0})"
         )
@@ -986,8 +992,12 @@ class GraphAgent(BaseAgent):
                 routing_kwargs["max_tokens"] = self.routing_max_tokens or 250
                 routing_kwargs["temperature"] = 0.0
 
-            if self.routing_provider in ("openai", "azure") and self.service_tier:
-                routing_kwargs["service_tier"] = self.service_tier
+            # Only openai/azure accept service_tier. A Gemini or Groq router simply does
+            # not get the field — switching routing_model to gemini-flash-lite stays valid,
+            # it just stops buying priority (see _gemini_routing_thinking_body for the cap
+            # that path needs instead).
+            if self.routing_provider in ("openai", "azure") and self.routing_service_tier:
+                routing_kwargs["service_tier"] = self.routing_service_tier
 
             self._routing_reasoning_effort_used = routing_kwargs.get("reasoning_effort")
 
