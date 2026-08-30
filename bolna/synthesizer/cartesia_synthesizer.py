@@ -6,6 +6,7 @@ import uuid
 
 import aiohttp
 import base64
+from collections import deque
 import websockets
 from websockets.exceptions import InvalidHandshake
 
@@ -57,6 +58,12 @@ class CartesiaSynthesizer(StreamSynthesizer):
         self.turn_id = 0
         self.sequence_id = 0
         self.context_ids_to_ignore = set()
+        # Word timings not yet attributed to an audio chunk, and how much audio has
+        # been emitted for the current context. Cartesia sends timestamps as it
+        # generates — generally ahead of the audio they describe — so they queue here
+        # until the chunk that covers them goes out.
+        self._pending_words = deque()
+        self._audio_elapsed_s = 0.0
         self.ws_request_id = None
         # end_of_llm_stream sent on the current context → the next push must open a fresh one.
         self.context_finalized = False
@@ -87,6 +94,11 @@ class CartesiaSynthesizer(StreamSynthesizer):
 
     def _update_context(self, meta_info):
         self.context_id = str(uuid.uuid4())
+        # A new context is a new utterance: its audio clock restarts at zero, and any
+        # words left over from the last one (a barge-in cancels mid-sentence) would
+        # otherwise be attributed to this one's first chunk.
+        self._pending_words.clear()
+        self._audio_elapsed_s = 0.0
         self.turn_id = meta_info.get("turn_id", 0)
         self.sequence_id = meta_info.get("sequence_id", 0)
         logger.info(
@@ -128,6 +140,13 @@ class CartesiaSynthesizer(StreamSynthesizer):
                 else {"container": "raw", "encoding": "pcm_s16le", "sample_rate": int(self.sampling_rate)}
             ),
             "generation_config": {"speed": self.speed},
+            # Word-level timings, so each audio chunk can be labelled with the words it
+            # actually speaks (meta_info["text_synthesized"]). Without this the stream
+            # yields audio and nothing else, every mark carries text_len=0, and a client
+            # can only show the sentence at LLM pace — seconds before the voice reaches
+            # it. If a model ignores or rejects the flag no timestamps arrive, the text
+            # stays empty, and everything behaves exactly as it did before.
+            "add_timestamps": True,
         }
         if text:
             payload["continue"] = True
@@ -181,6 +200,35 @@ class CartesiaSynthesizer(StreamSynthesizer):
         except Exception as e:
             logger.error(f"Unexpected error in sender: {e}")
 
+    def _bytes_per_second(self) -> int:
+        """Playback rate of the format we asked Cartesia for (see form_payload)."""
+        return 8000 if self.use_mulaw else int(self.sampling_rate) * 2
+
+    def _words_spoken_by(self, audio: bytes) -> str:
+        """The words this chunk speaks, from the buffered timings.
+
+        Each chunk covers the audio span [elapsed, elapsed + its own duration); every
+        buffered word whose start falls inside that span is spoken by it. Words that
+        have not arrived yet simply land on a later chunk — the reveal lags a beat and
+        catches up, and the turn's last chunk settles the text either way.
+        """
+        bps = self._bytes_per_second()
+        if not bps:
+            return ""
+        span_end = self._audio_elapsed_s + (len(audio) / bps)
+        spoken = []
+        while self._pending_words and self._pending_words[0][1] < span_end:
+            spoken.append(self._pending_words.popleft()[0])
+        self._audio_elapsed_s = span_end
+        return (" ".join(spoken) + " ") if spoken else ""
+
+    def _unpack_receiver_message(self, item):
+        """receiver() yields (audio, {"text_synthesized": ...}) for audio chunks and
+        bare bytes for the end-of-stream sentinel."""
+        if isinstance(item, tuple):
+            return item
+        return item, {}
+
     async def receiver(self):
         not_connected_since = None
         while True:
@@ -209,8 +257,20 @@ class CartesiaSynthesizer(StreamSynthesizer):
                 if data.get("context_id") in self.context_ids_to_ignore:
                     continue
 
+                # Word timings for the audio still to come. Buffered rather than used
+                # immediately: they arrive ahead of the chunks that speak them.
+                wt = data.get("word_timestamps")
+                if wt and wt.get("words"):
+                    words = wt.get("words") or []
+                    starts = wt.get("start") or []
+                    for i, w in enumerate(words):
+                        self._pending_words.append((w, starts[i] if i < len(starts) else 0.0))
+                    continue
+
                 if "data" in data and data["data"]:
-                    yield base64.b64decode(data["data"])
+                    audio = base64.b64decode(data["data"])
+                    yield (audio, {"text_synthesized": self._words_spoken_by(audio)})
+                    continue
                 elif "done" in data and data["done"]:
                     logger.info(
                         f"Cartesia recv done context_id={data.get('context_id')} request_id={self.ws_request_id}"

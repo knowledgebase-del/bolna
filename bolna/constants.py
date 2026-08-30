@@ -93,6 +93,19 @@ PRE_FUNCTION_CALL_MESSAGE = {
     "ge": "Geben Sie mir einen Moment Zeit, ich bin gleich wieder bei Ihnen.",
 }
 
+# Tokens a prompt uses to mean "say nothing this turn".
+#
+# Retell defines NO_RESPONSE_NEEDED and its platform intercepts it; prompts written
+# to that convention are common here (the portal is modelled on Retell), and bolna
+# had no handling at all — so the model emitted the literal string, it went to the
+# synthesizer like any other text, and the caller heard the agent say
+# "NO_RESPONSE_NEEDED" out loud mid-conversation.
+#
+# Matched case-insensitively, ignoring surrounding punctuation and whitespace. Only a
+# response that is ENTIRELY a sentinel is suppressed: a turn that merely mentions the
+# token in passing is still a real answer and must be spoken.
+SILENT_RESPONSE_SENTINELS = ("NO_RESPONSE_NEEDED",)
+
 # Spoken when the LLM stream raises (provider 5xx, timeout, transport error).
 #
 # The agents used to yield the exception text itself as the assistant's turn, so the
@@ -101,9 +114,13 @@ PRE_FUNCTION_CALL_MESSAGE = {
 # { "code": 503 …». Nothing downstream filters an assistant turn, so the only place to
 # stop it is where it is produced. This also lands in the conversation history, which
 # the router reads on the next turn, so it has to read as a plausible thing to have said.
+# Wording matters: this fires when the MODEL failed, not the caller. "I didn't catch
+# that" tells the caller they were unclear and invites them to repeat themselves —
+# observed on a call where a Gemini mid-stream stall made the agent blame a caller who
+# had spoken perfectly clearly, who then said the same thing twice more.
 LLM_ERROR_FALLBACK_MESSAGE = {
-    "en": "Sorry, I didn't catch that — could you say it again?",
-    "ge": "Entschuldigung, das habe ich nicht verstanden — können Sie das wiederholen?",
+    "en": "Sorry, I lost my train of thought there — could you say that again?",
+    "ge": "Entschuldigung, ich habe den Faden verloren — können Sie das wiederholen?",
 }
 
 FILLER_PHRASES = [

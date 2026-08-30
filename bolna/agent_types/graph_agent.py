@@ -1218,6 +1218,51 @@ class GraphAgent(BaseAgent):
         logger.info(f"Node '{self.current_node_id}' forcing specific function: {fn}")
         return {"type": "function", "function": {"name": fn}}
 
+    def _resolve_turn_tools(self, current_node, message, meta_info):
+        """(tool_choice, forced_name, tools) for this turn — or nothing at all.
+
+        `_disable_tools` in meta_info means the caller wants a plain spoken answer with
+        no function calls available. Telling the model in words not to call a tool is
+        not enough: after a refused call, a retry carrying the same instruction produced
+        the identical call again, because the cached native Parts in the history are a
+        stronger signal than any system line. An empty tool list is not a request —
+        _declarations_for returns [] and _build_config never sets config.tools, so there
+        is nothing to call.
+        """
+        if (meta_info or {}).get("_disable_tools"):
+            logger.info("BOLNA_TRACE_TOOLS node=%s forced=None offered=[] (tools disabled for this turn)",
+                        (current_node or {}).get("id"))
+            return None, None, []
+        tool_choice = self._get_tool_choice_for_node(history=message)
+        forced_name = tool_choice["function"]["name"] if tool_choice else None
+        node_tools = self._tools_for_node(current_node, forced_name)
+        self._log_node_tools(current_node, forced_name, node_tools)
+        return tool_choice, forced_name, node_tools
+
+    def _log_node_tools(self, node: Optional[dict], forced_name, tools) -> None:
+        """Record exactly which tools this turn offers the model.
+
+        `None` here means "no filtering applied — the model sees every tool", which is
+        what _tools_for_node returns when the subset happens to equal the full set. That
+        distinction is invisible from the outside and it matters: a call booked an
+        appointment from node-final_confirm even though book_appointment is scoped to
+        node-create_appt, and without this line there is no way to tell whether the
+        scope filter ran and passed it, or never narrowed the list at all.
+        """
+        try:
+            if tools is None:
+                offered = "ALL (no filtering)"
+            else:
+                offered = [t.get("function", {}).get("name") for t in tools]
+            logger.info(
+                "BOLNA_TRACE_TOOLS node=%s forced=%s offered=%s",
+                (node or {}).get("id"),
+                forced_name,
+                offered,
+            )
+        except Exception as e:  # instrumentation must never break a turn
+            logger.debug(f"tool-list logging failed: {e}")
+
     def _tools_for_node(self, node: Optional[dict], forced_name: Optional[str] = None) -> Optional[List[dict]]:
         """Tools visible on this node (global + node-scoped + forced), or None to use the full set.
 
@@ -1473,9 +1518,7 @@ class GraphAgent(BaseAgent):
                     }
                 )
                 yield {"messages": messages}
-                tool_choice = self._get_tool_choice_for_node(history=message)
-                forced_name = tool_choice["function"]["name"] if tool_choice else None
-                node_tools = self._tools_for_node(current_node, forced_name)
+                tool_choice, forced_name, node_tools = self._resolve_turn_tools(current_node, message, meta_info)
                 async for chunk in self.llm.generate_stream(
                     messages, synthesize=synthesize, meta_info=meta_info, tool_choice=tool_choice, tools=node_tools
                 ):
@@ -1577,9 +1620,7 @@ class GraphAgent(BaseAgent):
 
             messages = await self._build_messages(message, meta_info=meta_info)
             yield {"messages": messages}
-            tool_choice = self._get_tool_choice_for_node(history=message)
-            forced_name = tool_choice["function"]["name"] if tool_choice else None
-            node_tools = self._tools_for_node(current_node, forced_name)
+            tool_choice, forced_name, node_tools = self._resolve_turn_tools(current_node, message, meta_info)
             async for chunk in self.llm.generate_stream(
                 messages, synthesize=synthesize, meta_info=meta_info, tool_choice=tool_choice, tools=node_tools
             ):

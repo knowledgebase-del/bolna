@@ -111,7 +111,25 @@ class DeepgramTranscriber(BaseTranscriber):
         self.turn_counter = 0
         # Timeout tracking for stuck utterances
         self.last_interim_time = None
-        self.interim_timeout = kwargs.get("interim_timeout", 1.2)
+        # Safety net for an utterance Deepgram never finalizes. It must never fire
+        # before Deepgram's OWN end-of-utterance could plausibly arrive, or it stops
+        # being a safety net and starts cutting normal speech in half: at the old flat
+        # 1.2s — barely above utterance_end_ms of 1000ms — one call force-finalized 26
+        # times, splitting "april ten nineteen eighty nine" into "april ten" (answered
+        # by the agent as if complete) and then the rest as a SECOND turn.
+        #
+        # Derived from utterance_end_ms so it cannot race it again if that is retuned.
+        self.interim_timeout = kwargs.get("interim_timeout") or max(
+            3.0, (self.utterance_end_ms / 1000.0) + 1.5
+        )
+        # Set when monitor_utterance_timeout gives up on an utterance and emits it from
+        # the last interim. Deepgram still delivers its own is_final/speech_final for
+        # that SAME audio afterwards (measured 3.5s later on a slow leg), and without
+        # this the late result re-armed emission and the utterance was sent to the LLM
+        # a SECOND time — a duplicate user turn, a duplicate reply, and a duplicate node
+        # transition. Cleared when genuinely new speech starts.
+        self._force_finalized_utterance = False
+        self._force_finalized_text = ""
         self.utterance_timeout_task = None
         self.connection_error = None
 
@@ -330,6 +348,8 @@ class DeepgramTranscriber(BaseTranscriber):
 
     def _reset_turn_state(self):
         """Reset turn state variables after finalizing a transcript"""
+        # NOT reset here: _force_finalized_utterance must outlive the turn it belongs
+        # to, because the late result it guards against arrives after this runs.
         self.speech_start_time = None
         self.speech_end_time = None
         self._turn_first_speech_epoch_ms = None
@@ -357,6 +377,8 @@ class DeepgramTranscriber(BaseTranscriber):
 
         if not transcript_to_send:
             logger.warning("No transcript available to force-finalize")
+            self._force_finalized_utterance = False
+            self._force_finalized_text = ""
             self._reset_turn_state()
             return
 
@@ -394,6 +416,10 @@ class DeepgramTranscriber(BaseTranscriber):
         logger.info(f"Force-finalized transcript after timeout: {transcript_to_send}")
 
         # Send to queue (unblocks _listen_transcriber)
+        # This utterance has now been handed to the LLM from a fallback, so Deepgram's
+        # own late result for the SAME WORDS must be ignored (see _force_finalized_utterance).
+        self._force_finalized_utterance = True
+        self._force_finalized_text = (transcript_to_send or "").strip().lower()
         await self.push_to_transcriber_queue(create_ws_data_packet(data, self.meta_info))
 
         # Reset state (same as normal UtteranceEnd)
@@ -674,6 +700,9 @@ class DeepgramTranscriber(BaseTranscriber):
                     self.speech_start_time = timestamp_ms()
                     self.current_turn_interim_details = []
                     self.is_transcript_sent_for_processing = False
+                    # New speech: whatever we force-finalized before is closed out.
+                    self._force_finalized_utterance = False
+                    self._force_finalized_text = ""
 
                     logger.info(f"Starting new turn with turn_id: {self.current_turn_id}")
                     logger.info(
@@ -757,7 +786,36 @@ class DeepgramTranscriber(BaseTranscriber):
                         )
 
                         if self.is_transcript_sent_for_processing:
-                            self.is_transcript_sent_for_processing = False
+                            # A late result for an utterance we already force-finalized
+                            # must NOT re-arm emission — that is the duplicate-turn path.
+                            # Only a genuinely new utterance may clear this, which
+                            # SpeechStarted does.
+                            incoming = (transcript or "").strip().lower()
+                            prior = getattr(self, "_force_finalized_text", "")
+                            # Suppress ONLY a re-delivery of the words we already sent.
+                            # The first version of this guard dropped every late final,
+                            # which silently ate real speech: a caller said "my date of
+                            # birth is april ten" … "nineteen eighty nine", the timeout
+                            # cut after "april ten", and the year — arriving 1s later as
+                            # its own final — was thrown away. Losing what someone said
+                            # is far worse than an extra turn, so anything that adds
+                            # words gets through.
+                            if self._force_finalized_utterance and prior and (
+                                incoming == prior or (incoming and prior.startswith(incoming))
+                            ):
+                                logger.info(
+                                    "Ignoring late is_final — same words already force-finalized: "
+                                    f"{transcript[:60]!r}"
+                                )
+                            else:
+                                if self._force_finalized_utterance:
+                                    logger.info(
+                                        "Late is_final carries NEW speech after a force-finalize; "
+                                        f"emitting it: {transcript[:60]!r}"
+                                    )
+                                    self._force_finalized_utterance = False
+                                    self._force_finalized_text = ""
+                                self.is_transcript_sent_for_processing = False
 
                     if msg["speech_final"] and self.final_transcript.strip():
                         if not self.is_transcript_sent_for_processing and self.final_transcript.strip():

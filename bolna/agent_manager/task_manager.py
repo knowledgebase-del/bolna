@@ -95,6 +95,7 @@ from bolna.helpers.utils import (
     format_error_message,
     enrich_context_with_time_variables,
 )
+from bolna.constants import SILENT_RESPONSE_SENTINELS
 from bolna.helpers import stream_observer
 from bolna.helpers.logger_config import configure_logger
 from ..helpers.mark_event_meta_data import MarkEventMetaData
@@ -269,6 +270,9 @@ class TaskManager(BaseManager):
         self._cb_tts_last = None
 
         self.conversation_start_init_ts = time.time() * 1000
+        # Set only while re-running a turn whose tool call was refused, so that retry
+        # cannot itself trigger another recovery.
+        self._recovering_from_blocked_tool = False
         self.llm_latencies = ComponentLatencies()
         self.transcriber_latencies = ComponentLatencies()
         self.synthesizer_latencies = ComponentLatencies()
@@ -847,6 +851,19 @@ class TaskManager(BaseManager):
             else:
                 redacted_headers[key] = value
         return redacted_headers
+
+    def _active_asr_turn_id(self):
+        """The transcriber's id for the utterance being spoken right now, or None.
+
+        This is the only stable boundary between one utterance and the next: a
+        consumer streaming partial transcripts needs it to know whether new text
+        revises the current bubble or starts a new one. Unwraps TranscriberPool the
+        same way _stamp_llm_latency_dict does.
+        """
+        _t = self.tools.get("transcriber")
+        if hasattr(_t, "transcribers") and hasattr(_t, "active_label"):
+            _t = _t.transcribers.get(_t.active_label, _t)
+        return getattr(_t, "current_turn_id", None) or getattr(_t, "turn_counter", None)
 
     def _stamp_llm_latency_dict(
         self,
@@ -2039,7 +2056,24 @@ class TaskManager(BaseManager):
                 return {"system_prompt": SUMMARIZATION_PROMPT}
         return prompt
 
+    @staticmethod
+    def _is_silent_sentinel(text) -> bool:
+        """True when a response is ENTIRELY a "say nothing" token.
+
+        Substring matching would be wrong: an agent explaining the convention, or a
+        caller's words echoed back, must still be spoken. Only a turn that consists of
+        nothing but the token is suppressed.
+        """
+        stripped = (text or "").strip().strip(".!?,;:'\"").strip()
+        return bool(stripped) and any(stripped.upper() == s.upper() for s in SILENT_RESPONSE_SENTINELS)
+
     def __process_stop_words(self, text_chunk, meta_info):
+        # A "say nothing" sentinel must never reach the synthesizer — that is how the
+        # caller ended up hearing the agent read "NO_RESPONSE_NEEDED" aloud.
+        if self._is_silent_sentinel(text_chunk):
+            logger.info(f"Suppressing silent-response sentinel from synthesis: {text_chunk.strip()!r}")
+            return ""
+
         # THis is to remove stop words. Really helpful in smaller 7B models
         if "end_of_llm_stream" in meta_info and meta_info["end_of_llm_stream"] and "user" in text_chunk[-5:].lower():
             if text_chunk[-5:].lower() == "user:":
@@ -3684,6 +3718,19 @@ class TaskManager(BaseManager):
             self._stage_assistant_history(meta_info, llm_response)
             self.conversation_history.sync_interim(messages)
 
+    def _take_blocked_undeclared_call(self):
+        """Pop the tool name the LLM refused to call this turn, if any.
+
+        Set by the provider when the model asks for a tool the current node does not
+        offer (gemini_llm). Popped rather than read so one block triggers exactly one
+        recovery, however many chunks carried it.
+        """
+        llm = getattr(self.tools.get("llm_agent"), "llm", None)
+        blocked = getattr(llm, "_blocked_undeclared_call", None)
+        if blocked and llm is not None:
+            llm._blocked_undeclared_call = None
+        return blocked
+
     async def __do_llm_generation(
         self, messages, meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=False
     ):
@@ -3978,7 +4025,7 @@ class TaskManager(BaseManager):
                 # turn_id) because that is exactly what ConversationHistory.append_assistant
                 # stamps on the committed turn — a different key here would render the
                 # partials as a second bubble instead of growing the first.
-                if self._is_conversation_task():
+                if self._is_conversation_task() and not self._is_silent_sentinel(llm_response):
                     stream_observer.emit_partial(
                         "assistant",
                         llm_response.strip(),
@@ -4026,6 +4073,48 @@ class TaskManager(BaseManager):
             raise
         except Exception as e:
             raise LLMError(str(e), provider=self.llm_config.get("provider"), model=self.llm_config.get("model")) from e
+
+        # A tool the node does not offer was refused. The model has already committed to
+        # whatever it said alongside the call — usually a promise to go and do the thing —
+        # and with the action dropped nothing would follow it. Re-run the turn with tools
+        # disabled so it answers in words instead of leaving the caller in silence.
+        # should_trigger_function_call=False makes this terminal: the retry cannot block again.
+        blocked_tool = self._take_blocked_undeclared_call()
+        if blocked_tool and not function_tool and not self._recovering_from_blocked_tool:
+            # Re-ask with an explicit instruction rather than the same prompt: nothing in
+            # task_manager can turn the node's tools off, so an identical retry would just
+            # produce the identical refused call. Telling the model the tool is unavailable
+            # here is what actually changes the answer.
+            logger.info(
+                f"Re-generating turn after refusing '{blocked_tool}' — otherwise the turn "
+                "ends on a promise the blocked call was supposed to fulfil"
+            )
+            self._recovering_from_blocked_tool = True
+            try:
+                # Tools OFF for the retry, not merely discouraged. The first version of
+                # this appended a system line saying the tool was unavailable and left the
+                # tools in place; the model called the same tool again and emitted the same
+                # promise, because the cached function Parts in its history outweigh a
+                # system sentence. With no declarations there is nothing to call.
+                retry_meta = self._spawn_followup_meta_info(meta_info)
+                retry_meta["_disable_tools"] = True
+                await self.__do_llm_generation(
+                    messages
+                    + [
+                        {
+                            "role": "system",
+                            "content": (
+                                f"You cannot use the '{blocked_tool}' tool on this step. Reply to "
+                                "the caller in words, briefly, and ask for whatever you still need."
+                            ),
+                        }
+                    ],
+                    retry_meta,
+                    next_step,
+                    should_bypass_synth=should_bypass_synth,
+                )
+            finally:
+                self._recovering_from_blocked_tool = False
 
         filler_message = compute_function_pre_call_message(
             meta_info.get("detected_language") or self.language, function_tool, function_tool_message
@@ -4343,6 +4432,14 @@ class TaskManager(BaseManager):
             return
         staged = self._pending_assistant_history.pop(sequence_id, None)
         if staged is None:
+            return
+
+        if self._is_silent_sentinel(staged.get("content")):
+            logger.info(
+                "Not committing silent-response sentinel as an assistant turn "
+                f"(seq={sequence_id}): {str(staged.get('content')).strip()!r}"
+            )
+            self._committed_assistant_sequences.add(sequence_id)
             return
 
         self._committed_assistant_sequences.add(sequence_id)
@@ -4734,11 +4831,15 @@ class TaskManager(BaseManager):
                         interim_transcript_len += len(message["data"].get("content").strip().split(" "))
                         transcript_content = message["data"].get("content", "")
 
-                        # No key: the caller's final transcript is committed by
-                        # append_user with no key either, so leaving it null lets a
-                        # consumer merge the interims and the final into one bubble on
-                        # "still open" rather than on identity.
-                        stream_observer.emit_partial("user", transcript_content.strip())
+                        # Keyed by the ASR turn id, which is what actually delimits one
+                        # utterance from the next. Anything else drifts: a session-scoped
+                        # key minted on "first interim since the last commit" reopened a
+                        # second bubble for the tail interims Deepgram delivers AFTER a
+                        # turn is force-finalized, and then let the NEXT utterance
+                        # overwrite it.
+                        stream_observer.emit_partial(
+                            "user", transcript_content.strip(), self._active_asr_turn_id()
+                        )
 
                         # Deepgram sometimes delivers the real speech_final for an utterance
                         # *after* our utterance timeout already force-finalized the same text

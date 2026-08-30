@@ -158,6 +158,12 @@ class GeminiLLM(BaseLLM):
         self.tools = self.bolna_tools_raw
         self.trigger_function_call = bool(gemini_declarations)
         self.thinking_budget = kwargs.get("thinking_budget", 0)
+        # google-genai exposes the same tier concept OpenAI does
+        # (GenerateContentConfig.service_tier, values unspecified|flex|standard|priority),
+        # so llm_config["service_tier"] can be honoured here instead of being silently
+        # dropped as it was — a Gemini agent reported service_tier=None on every
+        # conversation turn while its OpenAI router reported "priority".
+        self.service_tier = kwargs.get("service_tier")
         self.run_id = kwargs.get("run_id", None)
         self.language = kwargs.get("language", "en")
         # Cache of original types.Part objects keyed by function call id.
@@ -326,9 +332,33 @@ class GeminiLLM(BaseLLM):
         if thinking_config is not None:
             config_kwargs["thinking_config"] = thinking_config
 
+        if self.service_tier:
+            # Membership-checked, not constructor-checked: types.ServiceTier("bogus")
+            # does NOT raise — the SDK warns and hands back the unknown value, which
+            # would then be sent to the API and 400 the turn. An unrecognised tier must
+            # mean "no tier", i.e. exactly today's behaviour.
+            wanted = str(self.service_tier).strip().lower()
+            valid = {t.value for t in types.ServiceTier}
+            if wanted in valid:
+                config_kwargs["service_tier"] = types.ServiceTier(wanted)
+            else:
+                logger.warning(
+                    f"[GeminiLLM] ignoring unknown service_tier {self.service_tier!r}; "
+                    f"valid: {sorted(valid)}"
+                )
+
         config = types.GenerateContentConfig(**config_kwargs)
 
         declarations = self._declarations_for(tools)
+        # What this turn is actually allowed to call. Gemini will happily emit a
+        # functionCall for a name it only knows from history — a graph agent booked an
+        # appointment from node-final_confirm, which was offered ['end_call'] and
+        # nothing else, because book_appointment appeared in earlier turns as a cached
+        # native Part. Declaring a subset is therefore a hint, not a constraint, so the
+        # constraint is enforced on the way out (see generate_stream).
+        self._declared_this_turn = {d.name for d in declarations}
+        # Cleared here so it only ever describes the turn being built right now.
+        self._blocked_undeclared_call = None
         if declarations:
             config.tools = [types.Tool(function_declarations=declarations)]
             config.automatic_function_calling = types.AutomaticFunctionCallingConfig(disable=True)
@@ -422,6 +452,27 @@ class GeminiLLM(BaseLLM):
 
                         if part.function_call:
                             fn_name = part.function_call.name
+                            # Drop a call the model was not offered this turn. Letting it
+                            # through silently bypasses the graph's node scoping: the tool
+                            # runs a node early, the router then sees the work already
+                            # done and skips the node that was supposed to do it (and, in
+                            # the observed case, the node that reads the confirmation
+                            # number aloud). Ignoring it leaves the turn to the router,
+                            # which routes to the node that DOES declare the tool.
+                            declared = getattr(self, "_declared_this_turn", None)
+                            if declared is not None and fn_name not in declared:
+                                logger.warning(
+                                    f"[GeminiLLM] ignoring undeclared function call fn={fn_name}; "
+                                    f"this turn offered {sorted(declared)}"
+                                )
+                                # Recorded so the caller can recover. Dropping the call on its
+                                # own strands the caller: the model has usually ALSO emitted a
+                                # promise in the same turn ("Just give me a moment, I'll be back
+                                # with you") and, with the action blocked, nothing follows it —
+                                # observed as 11.5s of silence ending in the are-you-still-there
+                                # check. task_manager re-generates the turn with tools disabled.
+                                self._blocked_undeclared_call = fn_name
+                                continue
                             raw_id = part.function_call.id
                             call_id = raw_id or ("call_" + str(uuid.uuid4())[:8])
                             chunk_args = dict(part.function_call.args) if part.function_call.args else {}

@@ -157,6 +157,20 @@ class DefaultOutputHandler:
 
                     self.mark_event_meta_data.update_data(mark_id, mark_event_meta_data)
                     mark_message = {"type": "mark", "name": mark_id}
+                    # Carry the words this chunk actually speaks. A browser client already
+                    # holds the mark until the audio it follows has been heard, so the same
+                    # signal can reveal the transcript in step with the voice instead of
+                    # dumping the whole sentence the moment the LLM finishes generating it
+                    # (the LLM is done in ~1s; the audio plays for ~5s).
+                    #
+                    # `key` matches the response_uid the transcript channel commits the turn
+                    # under, so the reveal lands in that turn's own bubble. Additive: a
+                    # client that ignores these fields behaves exactly as before.
+                    spoken = mark_event_meta_data.get("text_synthesized") or ""
+                    if spoken:
+                        mark_message["text"] = spoken
+                        mark_message["key"] = meta_info.get("response_uid") or meta_info.get("turn_id")
+                        mark_message["last"] = bool(mark_event_meta_data.get("is_final_chunk"))
                     await self.websocket.send_text(json.dumps(mark_message))
             else:
                 logger.error("Other modalities are not implemented yet")
