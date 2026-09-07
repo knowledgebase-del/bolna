@@ -497,9 +497,9 @@ class TaskManager(BaseManager):
         if self.__is_multiagent():
             for agent, config in self.task_config["tools_config"]["llm_agent"]["llm_config"]["agent_map"].items():
                 self.llm_config_map[agent] = config.copy()
-                self.llm_config_map[agent]["buffer_size"] = self.task_config["tools_config"]["synthesizer"][
-                    "buffer_size"
-                ]
+                self.llm_config_map[agent]["buffer_size"] = (
+                    self.task_config["tools_config"].get("synthesizer") or {}
+                ).get("buffer_size")
         else:
             if self.task_config["tools_config"]["llm_agent"] is not None:
                 if self.__is_knowledgebase_agent():
@@ -508,7 +508,9 @@ class TaskManager(BaseManager):
                         "model": self.llm_agent_config["llm_config"]["model"],
                         "max_tokens": self.llm_agent_config["llm_config"]["max_tokens"],
                         "provider": self.llm_agent_config["llm_config"]["provider"],
-                        "buffer_size": self.task_config["tools_config"]["synthesizer"].get("buffer_size"),
+                        "buffer_size": (self.task_config["tools_config"].get("synthesizer") or {}).get(
+                            "buffer_size"
+                        ),
                         "temperature": self.llm_agent_config["llm_config"]["temperature"],
                     }
                 elif self.__is_graph_agent():
@@ -517,7 +519,9 @@ class TaskManager(BaseManager):
                         "model": self.llm_agent_config["llm_config"]["model"],
                         "max_tokens": self.llm_agent_config["llm_config"]["max_tokens"],
                         "provider": self.llm_agent_config["llm_config"]["provider"],
-                        "buffer_size": self.task_config["tools_config"]["synthesizer"].get("buffer_size"),
+                        "buffer_size": (self.task_config["tools_config"].get("synthesizer") or {}).get(
+                            "buffer_size"
+                        ),
                         "temperature": self.llm_agent_config["llm_config"]["temperature"],
                     }
                 else:
@@ -604,8 +608,11 @@ class TaskManager(BaseManager):
         self.conversation_config = None
 
         if task_id == 0:
-            provider_config = self.task_config["tools_config"]["synthesizer"].get("provider_config")
-            self.synthesizer_voice = provider_config["voice"]
+            # `synthesizer` is None for a text-only agent — there is no voice to name.
+            provider_config = (self.task_config["tools_config"].get("synthesizer") or {}).get(
+                "provider_config"
+            ) or {}
+            self.synthesizer_voice = provider_config.get("voice")
             self.hangup_detail = None
             self.end_call_primary = False  # set below if task_config opts in
 
@@ -650,7 +657,13 @@ class TaskManager(BaseManager):
             # for long pauses and rushing
             if self.conversation_config is not None:
                 # TODO need to get this for azure - for azure the subtraction would not happen
-                self.minimum_wait_duration = self.task_config["tools_config"]["transcriber"]["endpointing"]
+                # `transcriber` is Optional in the config model, and a text-only agent sets
+                # it to null. Falls back to InterruptionManager's own default (0) rather
+                # than None, which would TypeError on its `minimum_wait_duration -
+                # incremental_delay` arithmetic.
+                self.minimum_wait_duration = (
+                    self.task_config["tools_config"].get("transcriber") or {}
+                ).get("endpointing", 0) or 0
                 self.last_spoken_timestamp = time.time() * 1000
                 self.incremental_delay = self.conversation_config.get("incremental_delay", 100)
 
@@ -1362,6 +1375,13 @@ class TaskManager(BaseManager):
             if should_record:
                 input_kwargs["conversation_recording"] = self.conversation_recording
 
+            # Needed by BOTH branches: process_message's "init" case dereferences
+            # self.observable_variables, so a turn-based session that receives an init
+            # frame (how a web client passes its dynamic variables) used to die of an
+            # AttributeError inside _listen — which silently stops the input handler, so
+            # every later typed message was simply never read.
+            input_kwargs["observable_variables"] = self.observable_variables
+
             if self.turn_based_conversation:
                 input_kwargs["turn_based_conversation"] = True
                 input_handler_class = SUPPORTED_INPUT_HANDLERS.get("default")
@@ -1379,8 +1399,6 @@ class TaskManager(BaseManager):
                     TelephonyProvider.VOBIZ.value,
                 ) and self.kwargs.get("telephony_credentials"):
                     input_kwargs["auth_credentials"] = self.kwargs["telephony_credentials"]
-
-                input_kwargs["observable_variables"] = self.observable_variables
 
                 # Asterisk (sip-trunk): pass context data for pre-parsed MEDIA_START
                 if (
@@ -1674,9 +1692,12 @@ class TaskManager(BaseManager):
 
     def __setup_synthesizer(self, llm_config=None):
         if self._is_conversation_task():
+            # `transcriber` is Optional (null for a text-only agent), and this is only a
+            # TTS model hint — with no transcriber there is no language to read, so the
+            # non-turbo default stands.
             self.kwargs["use_turbo"] = (
-                self.task_config["tools_config"]["transcriber"]["language"] == DEFAULT_LANGUAGE_CODE
-            )
+                self.task_config["tools_config"].get("transcriber") or {}
+            ).get("language") == DEFAULT_LANGUAGE_CODE
         if self.task_config["tools_config"]["synthesizer"] is not None:
             synth_config = self.task_config["tools_config"]["synthesizer"]
 
@@ -1860,7 +1881,9 @@ class TaskManager(BaseManager):
                 injected_cfg["use_responses_api"] = True
             if self.llm_config.get("compact_threshold"):
                 injected_cfg["compact_threshold"] = self.llm_config["compact_threshold"]
-            injected_cfg["buffer_size"] = self.task_config["tools_config"]["synthesizer"].get("buffer_size")
+            injected_cfg["buffer_size"] = (
+                self.task_config["tools_config"].get("synthesizer") or {}
+            ).get("buffer_size")  # synthesizer is null for a text-only agent
             injected_cfg["language"] = self.language
             injected_cfg["turn_based_conversation"] = self.turn_based_conversation
 
@@ -1897,7 +1920,9 @@ class TaskManager(BaseManager):
                 injected_cfg["use_responses_api"] = True
             if self.llm_config.get("compact_threshold"):
                 injected_cfg["compact_threshold"] = self.llm_config["compact_threshold"]
-            injected_cfg["buffer_size"] = self.task_config["tools_config"]["synthesizer"].get("buffer_size")
+            injected_cfg["buffer_size"] = (
+                self.task_config["tools_config"].get("synthesizer") or {}
+            ).get("buffer_size")  # synthesizer is null for a text-only agent
             injected_cfg["language"] = self.language
 
             llm_agent = KnowledgeBaseAgent(injected_cfg)
@@ -2954,7 +2979,11 @@ class TaskManager(BaseManager):
 
         await self.tools["input"].stop_handler()
         logger.info("Stopped input handler")
-        if "transcriber" in self.tools and not self.turn_based_conversation:
+        # Closed whenever the tool exists, turn-based included: run() starts the
+        # transcriber task for any config that carries a transcriber block, so skipping
+        # this for turn-based left every typed session holding an open (and entirely
+        # idle) STT socket until the process exited.
+        if "transcriber" in self.tools:
             logger.info("Stopping transcriber")
             await self.tools["transcriber"].toggle_connection()
             await asyncio.sleep(2)  # Making sure whatever message was passed is over
@@ -3124,7 +3153,15 @@ class TaskManager(BaseManager):
 
                 followup_meta_info = self._spawn_followup_meta_info(meta_info)
                 await self.__do_llm_generation(
-                    messages, followup_meta_info, next_step, should_trigger_function_call=False
+                    messages,
+                    followup_meta_info,
+                    next_step,
+                    # Carried from the turn, as the general tool follow-up below already
+                    # does. Omitting it defaulted to False, so in a typed (turn-based)
+                    # session the end_call goodbye went to a synthesizer with no listener
+                    # and the final turn arrived empty.
+                    should_bypass_synth=meta_info.get("bypass_synth", False),
+                    should_trigger_function_call=False,
                 )
                 self._enter_hangup_state()
                 await self.wait_for_current_message()
@@ -3446,7 +3483,7 @@ class TaskManager(BaseManager):
                     messages,
                     followup_meta_info,
                     next_step,
-                    should_bypass_synth=False,
+                    should_bypass_synth=followup_meta_info.get("bypass_synth", False),
                     should_trigger_function_call=True,
                 )
                 self.execute_function_call_task = None
@@ -3528,7 +3565,16 @@ class TaskManager(BaseManager):
             messages = self.conversation_history.get_copy()
             followup_meta_info = self._spawn_followup_meta_info(meta_info)
             await self.__do_llm_generation(
-                messages, followup_meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=True
+                messages,
+            followup_meta_info,
+            next_step,
+            # Carried from the turn that triggered the tool, not hardcoded False: a typed
+            # (turn-based) session sets bypass_synth on its input packet and
+            # _spawn_followup_meta_info preserves it, but forcing False here sent every
+            # POST-TOOL-CALL reply to a synthesizer that has no listener in that mode — so
+            # the turn arrived as an empty <beginning_of_stream>/<end_of_stream> pair.
+            should_bypass_synth=followup_meta_info.get("bypass_synth", False),
+            should_trigger_function_call=True,
             )
             self.execute_function_call_task = None
             return
@@ -3926,8 +3972,34 @@ class TaskManager(BaseManager):
                     meta_info["text"] = static_text
                     meta_info["cached"] = True
                     meta_info["message_category"] = "static_node"
-                    ws_packet = create_ws_data_packet(static_hash, meta_info=meta_info, is_md5_hash=True)
-                    await self._synthesize(ws_packet)
+                    if should_bypass_synth:
+                        # A typed (turn-based) session runs no synthesizer listener, so the
+                        # usual static-node route — hand the md5 hash to _synthesize and let it
+                        # fetch or generate the clip — drops the node's words entirely: the
+                        # client saw <beginning_of_stream> and <end_of_stream> with nothing in
+                        # between. bypass_synth IS honoured, but only in _handle_llm_output, and
+                        # this branch returns before ever reaching it — which is exactly why
+                        # single-prompt agents worked in text mode and graph (flow) agents did
+                        # not. Send the sentence itself; the enclosing bos/eos frames already
+                        # come from _listen_llm_input_queue.
+                        meta_info["type"] = "text"
+                        await self.tools["output"].handle(
+                            create_ws_data_packet(static_text, meta_info)
+                        )
+                        # Staged assistant history is normally committed by the AUDIO
+                        # output loop when a sequence is approved for SEND — which never
+                        # runs in a typed session. Without this the node's words were
+                        # staged and then dropped, so they never reached
+                        # conversation_history and never got published to
+                        # transcript:{session}: a flow agent's chat rendered from that
+                        # channel (the portal's Test Chat panel, and the saved call
+                        # transcript) lost every static-node message, even though the
+                        # socket had delivered the text. LLM-streamed replies already
+                        # append themselves in the non-stream tail of this method.
+                        self._commit_staged_assistant_history(meta_info.get("sequence_id"))
+                    else:
+                        ws_packet = create_ws_data_packet(static_hash, meta_info=meta_info, is_md5_hash=True)
+                        await self._synthesize(ws_packet)
                     return
 
                 data = llm_message.data
@@ -4190,7 +4262,13 @@ class TaskManager(BaseManager):
         self._append_eager_llm_stub(meta_info)
 
         if self.turn_based_conversation:
-            self.history.append({"role": "user", "content": message["data"]})
+            # Through append_user, NOT self.history.append: `history` is a property onto
+            # conversation_history.messages, so appending to it mutated the list behind
+            # ConversationHistory's back. The model saw the turn either way, but nothing
+            # observing append_user did — so a typed session published no user turn to
+            # transcript:{session} and the saved transcript held only the agent's half.
+            # Same single append, and it now carries ChatRole.USER like every other row.
+            self.conversation_history.append_user(message["data"])
         messages = self.conversation_history.get_copy()
 
         # Request logs converted inside do_llm_generation for knowledgebase agent
@@ -4330,7 +4408,22 @@ class TaskManager(BaseManager):
                 "message_category": "agent_hangup",
                 "end_of_llm_stream": True,
             }
-            await self._synthesize(create_ws_data_packet(message, meta_info=meta_info))
+            if self.turn_based_conversation:
+                # No synthesizer listener in a typed session, so the farewell would be
+                # queued and never delivered — the caller's last turn (an end_call, e.g.
+                # "I can't verify you, goodbye") arrived completely empty. Sent with its
+                # own bos/eos because this fires from tool execution rather than from
+                # _listen_llm_input_queue's wrapper.
+                meta_info["type"] = "text"
+                await self.tools["output"].handle(
+                    create_ws_data_packet("<beginning_of_stream>", meta_info)
+                )
+                await self.tools["output"].handle(create_ws_data_packet(message, meta_info))
+                await self.tools["output"].handle(
+                    create_ws_data_packet("<end_of_stream>", meta_info)
+                )
+            else:
+                await self._synthesize(create_ws_data_packet(message, meta_info=meta_info))
             # Stamp after goodbye is queued — actual disconnect happens after it plays
             self.hangup_triggered_at = time.time()
         return
@@ -4744,7 +4837,7 @@ class TaskManager(BaseManager):
             await self.__process_end_of_conversation()
 
     async def _log_transcriber_connection_error(self, connection_error):
-        provider = self.task_config["tools_config"]["transcriber"].get("provider", "unknown")
+        provider = (self.task_config["tools_config"].get("transcriber") or {}).get("provider", "unknown")
         # Always record the drop — "error" when exception drove it, "drop" for clean closes
         # (e.g. Sarvam normal end-of-stream, Deepgram inactivity timeout on standby).
         self.transcriber_error_events.append(
@@ -5164,7 +5257,7 @@ class TaskManager(BaseManager):
             # Normal WebSocket closure (code 1000)
             pass
         except Exception as e:
-            provider = self.task_config["tools_config"]["transcriber"].get("provider")
+            provider = (self.task_config["tools_config"].get("transcriber") or {}).get("provider")
             model = self._component_model("transcriber")
             await self._end_call_on_component_error(
                 TranscriberError(str(e), provider=provider, model=model), HangupReason.TRANSCRIBER_ERROR
@@ -6102,7 +6195,16 @@ class TaskManager(BaseManager):
         self.interruption_manager.revalidate_sequence_id(followup_meta_info["sequence_id"])
         self.response_in_pipeline = True
         await self.__do_llm_generation(
-            messages, followup_meta_info, next_step, should_bypass_synth=False, should_trigger_function_call=True
+            messages,
+            followup_meta_info,
+            next_step,
+            # Carried from the turn that triggered the tool, not hardcoded False: a typed
+            # (turn-based) session sets bypass_synth on its input packet and
+            # _spawn_followup_meta_info preserves it, but forcing False here sent every
+            # POST-TOOL-CALL reply to a synthesizer that has no listener in that mode — so
+            # the turn arrived as an empty <beginning_of_stream>/<end_of_stream> pair.
+            should_bypass_synth=followup_meta_info.get("bypass_synth", False),
+            should_trigger_function_call=True,
         )
 
     async def switch_language(self, label, components=None, triggered_by: str = "manual", context_note: str = None):
@@ -6917,7 +7019,22 @@ class TaskManager(BaseManager):
                 self.stream_sid_ts = time.time() * 1000
                 if text and text.strip():
                     self.conversation_history.append_welcome_message(text)
-                await self._synthesize(create_ws_data_packet(text, meta_info=meta_info))
+                # A turn-based (typed) session has no synthesizer listener running
+                # (see run(): __listen_synthesizer is skipped when turn_based_conversation),
+                # so _synthesize would push the greeting onto a queue nobody reads and it
+                # would silently never arrive. Send it as text instead — same shape the
+                # telephony branch below already uses for turn-based.
+                if self.turn_based_conversation:
+                    meta_info["type"] = "text"
+                    await self.tools["output"].handle(
+                        create_ws_data_packet("<beginning_of_stream>", meta_info)
+                    )
+                    await self.tools["output"].handle(create_ws_data_packet(text, meta_info))
+                    await self.tools["output"].handle(
+                        create_ws_data_packet("<end_of_stream>", meta_info)
+                    )
+                else:
+                    await self._synthesize(create_ws_data_packet(text, meta_info=meta_info))
                 return
 
             start_time = asyncio.get_running_loop().time()
@@ -7026,7 +7143,9 @@ class TaskManager(BaseManager):
                 # tasks = [asyncio.create_task(self.tools['input'].handle())]
 
                 # In the case of web call we would play the first message once we receive the init event
-                if self.turn_based_conversation:
+                # — handle_init_event creates this same task, so creating it here as well would
+                # greet twice and append the welcome to conversation_history twice.
+                if self.turn_based_conversation and not self.is_web_based_call:
                     self.first_message_task = asyncio.create_task(self.__first_message())
 
                 if not self.turn_based_conversation:
@@ -7041,6 +7160,15 @@ class TaskManager(BaseManager):
                         "Since it's connected through dashboard, I'll run listen_llm_tas too in case user wants to simply text"
                     )
                     self.llm_queue_task = asyncio.create_task(self._listen_llm_input_queue())
+                    # Keeps the conversation alive when there is no transcriber to listen
+                    # to. `tasks` normally holds _listen_transcriber, which blocks for the
+                    # life of the call; a text-only agent (transcriber: null) adds nothing,
+                    # so the gather below returned instantly, run() fell through returning
+                    # None, and AssistantManager died on `task_output["run_id"] = ...`
+                    # before the first message could arrive. In turn-based mode the LLM
+                    # queue consumer plays exactly that long-lived role.
+                    if not tasks:
+                        tasks.append(self.llm_queue_task)
 
                 if "synthesizer" in self.tools and self._is_conversation_task() and not self.turn_based_conversation:
                     try:
@@ -7099,7 +7227,10 @@ class TaskManager(BaseManager):
                     (
                         "transcriber_task",
                         TranscriberError,
-                        self.task_config.get("tools_config", {}).get("transcriber", {}).get("provider"),
+                        # `or {}` rather than a .get default: for a text-only agent the
+                        # "transcriber" key EXISTS with value None, so the {} default never
+                        # applies and .get("provider") ran straight into None.
+                        (self.task_config.get("tools_config", {}).get("transcriber") or {}).get("provider"),
                     ),
                 ]:
                     task = getattr(self, attr, None)
@@ -7279,7 +7410,14 @@ class TaskManager(BaseManager):
                     "call_sid": self.call_sid,
                     "stream_sid": self.stream_sid,
                     "transcriber_duration": self.transcriber_duration,
-                    "synthesizer_characters": self.tools["synthesizer"].get_synthesized_characters(),
+                    # The synthesizer tool only exists when its config block does, so a
+                    # text-only agent (synthesizer: null) has none and subscripting here
+                    # used to KeyError away the whole end-of-call payload.
+                    "synthesizer_characters": (
+                        self.tools["synthesizer"].get_synthesized_characters()
+                        if self.tools.get("synthesizer")
+                        else 0
+                    ),
                     "ended_by_assistant": self.ended_by_assistant,
                     "latency_dict": {
                         "llm_latencies": self.llm_latencies.model_dump(),
