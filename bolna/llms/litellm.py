@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import logging
@@ -17,6 +18,22 @@ from bolna.helpers.logger_config import configure_logger
 logger = configure_logger(__name__)
 load_dotenv()
 
+# Anthropic removed the sampling parameters (temperature / top_p / top_k) on the
+# Claude 5 family and on Opus 4.7/4.8. Sending temperature returns a 400
+# "`temperature` is deprecated for this model", which surfaces here as a
+# BadRequestError on the very first user turn and hangs up the call with
+# HangupReason.LLM_ERROR. Omit it for those models instead.
+_NO_SAMPLING_PARAMS = re.compile(
+    r"claude-(?:fable|mythos|opus|sonnet)-5\b"
+    r"|claude-mythos-preview\b"
+    r"|claude-opus-4-[78]\b"
+)
+
+
+def model_accepts_sampling_params(model):
+    return not _NO_SAMPLING_PARAMS.search(model or "")
+
+
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("LiteLLM Router").setLevel(logging.WARNING)
 logging.getLogger("LiteLLM Proxy").setLevel(logging.WARNING)
@@ -29,7 +46,11 @@ class LiteLLM(BaseLLM):
         self.started_streaming = False
 
         self.language = language
-        self.model_args = {"max_tokens": max_tokens, "temperature": temperature, "model": self.model}
+        self.model_args = {"max_tokens": max_tokens, "model": self.model}
+        if model_accepts_sampling_params(self.model):
+            self.model_args["temperature"] = temperature
+        else:
+            logger.info(f"Dropping temperature={temperature}: {self.model} rejects sampling params")
         self.api_key = kwargs.get("llm_key", os.getenv("LITELLM_MODEL_API_KEY"))
         self.api_base = kwargs.get("base_url", os.getenv("LITELLM_MODEL_API_BASE"))
         self.api_version = kwargs.get("api_version", os.getenv("LITELLM_MODEL_API_VERSION"))
